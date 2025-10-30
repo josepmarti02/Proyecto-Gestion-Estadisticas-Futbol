@@ -163,7 +163,7 @@ def page_2():
        
 
 def page_3():
-    st.header("📅 Estadísticas por partido")
+    st.header("📅 Añadir partido")
     
     tab1, tab2 = st.tabs(["📤 Subir archivo de partido", "✍️ Añadir estadísticas manualmente"])
     with tab1:
@@ -195,25 +195,59 @@ def page_3():
             return
         
         jugadores = df_general["JUGADOR"].dropna().astype(str).tolist()
+
+        for key in ["no_convocados", "suplentes", "rival", "local_visitante", "goles_a_favor", "goles_en_contra"]:
+            st.session_state.setdefault(key, [] if key in ["no_convocados", "suplentes"] else 0)
+
+
+        st.markdown("### 👥 Convocatoria y alineación")
+
+        no_convocados = st.multiselect("Jugadores no convocados", options=jugadores, 
+                                       default=st.session_state["no_convocados"],
+                                       key = "multiselect_no_convocados")
+    
+        jugadores_disponibles = [j for j in jugadores if j not in no_convocados]
+        max_suplentes = max(len(jugadores_disponibles) - MAX_TITULARES,0)
+        suplentes_validos = [j for j in st.session_state["suplentes"] if j in jugadores_disponibles]
+        if max_suplentes <= 0:
+            suplentes_validos = []
+        elif len(suplentes_validos) > max_suplentes:
+            suplentes_validos = suplentes_validos[:max_suplentes]
+        
+        if max_suplentes == 0:
+            st.info("ℹ️ No hay margen para suplentes")
+            suplentes = []
+        else:
+            suplentes = st.multiselect("Jugadores suplentes", options=jugadores_disponibles,
+                                   default=suplentes_validos,
+                                   max_selections=max_suplentes,
+                                   key="multiselect_suplentes")
+        
+        if st.button("🔄 Actualizar convocatoria"):
+            st.session_state["no_convocados"] = no_convocados
+            st.session_state["suplentes"] = suplentes
+            st.session_state["rival"] = st.session_state.get("rival", "")
+            st.session_state["local_visitante"] = st.session_state.get("local_visitante", False)
+            st.session_state["goles_a_favor"] = st.session_state.get("goles_a_favor", 0)
+            st.session_state["goles_en_contra"] = st.session_state.get("goles_en_contra", 0)
+            st.success("✅ Convocatoria actualizada correctamente.")
+            st.rerun()
+
+        titulares = [j for j in jugadores_disponibles if j not in suplentes]
+        num_titulares = len(titulares)
+
+        if num_titulares< MAX_TITULARES:
+            st.warning(f"⚠️ Hay menos de {MAX_TITULARES} titulares ({num_titulares}). Faltan jugadores.")
+        elif num_titulares > MAX_TITULARES:
+            st.warning(f"⚠️ Hay más de {MAX_TITULARES} titulares ({num_titulares}). Revisa la convocatoria.")
+
         with st.form("form_partido_manual"):
-            rival = st.text_input("🏟️ Rival")
-            local_visitante = st.toggle("Tu equipo es el local?")
-            goles_a_favor = st.number_input("⚽ Goles a favor", min_value=0, step=1, value=0)
-            goles_en_contra = st.number_input("🥅 Goles en contra", min_value=0, step=1, value=0)
+            rival = st.text_input("🏟️ Rival", value=st.session_state.get("rival",""))
+            local_visitante = st.toggle("Tu equipo es el local?", value=st.session_state.get("local_visitante", False))
+            goles_a_favor = st.number_input("⚽ Goles a favor", min_value=0, step=1, value=st.session_state.get("goles_a_favor",0))
+            goles_en_contra = st.number_input("🥅 Goles en contra", min_value=0, step=1, value=st.session_state.get("goles_en_contra",0))
             resultado = f"{TU_EQUIPO} {goles_a_favor} - {goles_en_contra} {rival}" if local_visitante else f"{rival} {goles_en_contra} - {goles_a_favor} {TU_EQUIPO}"
 
-            st.markdown("### 👥 Convocatoria y alineación")
-
-            no_convocados = st.multiselect("Jugadores no convocados", options=jugadores)
-            jugadores_disponibles = [j for j in jugadores if j not in no_convocados]
-            max_suplentes = max(len(jugadores_disponibles) - MAX_TITULARES,0)
-            suplentes = st.multiselect("Jugadores suplentes", options=jugadores_disponibles, max_selections=max_suplentes)
-            titulares = [j for j in jugadores_disponibles if j not in suplentes]
-
-            if len(titulares) < MAX_TITULARES:
-                st.error(f"⚠️ Hay menos de {MAX_TITULARES} titulares. Revisa la convocatoria.")
-                return
-            
             df_manual = pd.DataFrame({
                 "JUGADOR":jugadores,
                 "CONVOCADO":[1 if j not in no_convocados else 0 for j in jugadores],
@@ -231,25 +265,32 @@ def page_3():
             
             submitted = st.form_submit_button("✅ Guardar partido")
         if submitted:
-            mitad = POSIBLES_MINUTOS/2
-            invalidos = df_editado[(df_editado["MINUTOS 1a PARTE"] > mitad)| (df_editado["MINUTOS 2a PARTE"]> mitad)]
-            if not invalidos.empty:
-                st.warning("⚠️ Algunos jugadores tienen minutos superiores al máximo permitido por parte.")
-                st.dataframe(invalidos[["JUGADOR", "MINUTOS 1a PARTE", "MINUTOS 2a PARTE"]])
-            
-            df_editado["TOTAL MINUTOS JUGADOS"] = df_editado["MINUTOS 1a PARTE"] + df_editado["MINUTOS 2a PARTE"]
-            df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / POSIBLES_MINUTOS * 100).round(2)
-            
-            st.success(f"{resultado} ✅ Guardado correctamente")
-            st.dataframe(df_editado, use_container_width=True)
+            if num_titulares != MAX_TITULARES:
+                st.error(f"⚠️ El número de titulares debe ser exactamente {MAX_TITULARES}. Actualmente hay {num_titulares}.")
+            elif len(jugadores_disponibles) < MAX_TITULARES:
+                st.error(f"⚠️ Hay menos de {MAX_TITULARES} jugadores disponibles ({len(jugadores_disponibles)}).")
+            else:
 
-            csv = df_editado.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "📤 Descargar archivo del partido",
-                data=csv,
-                file_name=f"estadisticas_{rival}.csv",
-                mime="text/csv"
-            )
+                mitad = POSIBLES_MINUTOS/2
+                invalidos = df_editado[(df_editado["MINUTOS 1a PARTE"] > mitad)| (df_editado["MINUTOS 2a PARTE"]> mitad)]
+                if not invalidos.empty:
+                    st.warning("⚠️ Algunos jugadores tienen minutos superiores al máximo permitido por parte.")
+                    st.dataframe(invalidos[["JUGADOR", "MINUTOS 1a PARTE", "MINUTOS 2a PARTE"]])
+                
+                else:
+                    df_editado["TOTAL MINUTOS JUGADOS"] = df_editado["MINUTOS 1a PARTE"] + df_editado["MINUTOS 2a PARTE"]
+                    df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / POSIBLES_MINUTOS * 100).round(2)
+                    
+                    st.success(f"{resultado} ✅ Guardado correctamente")
+                    st.dataframe(df_editado, use_container_width=True)
+
+                    csv = df_editado.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📤 Descargar archivo del partido",
+                        data=csv,
+                        file_name=f"estadisticas_{rival}.csv",
+                        mime="text/csv"
+                    )
 
 
 def page_4():
@@ -262,8 +303,8 @@ pg = st.navigation({
         st.Page(page_2, title="Individuales", icon="🪄")
     ],
     "Estadísticas por partido":[
-        st.Page(page_3, title="Estadísticas por partido"),
-        st.Page(page_4, title="Castelló A 10-1 Nules"),
+        st.Page(page_3, title="Añadir partido", icon="📅"),
+        st.Page(page_4, title="Histórico de partidos", icon="📜"),
     ]
 })
 pg.run()
