@@ -96,7 +96,7 @@ def page_1():
         "Estadística":resumen_estadisticas.keys(),
         "Total":resumen_estadisticas.values(),
        })
-        st.dataframe(df_resumen, use_container_width = True)
+        st.dataframe(df_resumen, width="stretch")
 
     if st.button("🔄 Actualizar datos", help="Pulsar si se ha modificado la base de datos"):
         st.cache_data.clear()
@@ -126,7 +126,7 @@ def page_2():
         df_select_jugadores = data[data["JUGADOR"].isin(select_jugador)]
         columnas = [col for col in columnas_datos_individuales if col in data.columns]
         df_mostrar = df_select_jugadores[["JUGADOR"]+ columnas]
-        st.dataframe(df_mostrar, use_container_width=True)
+        st.dataframe(df_mostrar, width='stretch')
         #KPIs resumen solo si se selecciona un jugador
         # if len(select_jugador) == 1:
         #     jugador = select_jugador[0]
@@ -153,7 +153,7 @@ def page_2():
                     metrica = seleccion_rankings[i+j]
                     col.markdown(f"🏅 {metrica}")
                     df_rank = ranking(data, metrica)
-                    col.dataframe(df_rank, use_container_width = True)
+                    col.dataframe(df_rank, width='stretch')
 
         
     else:
@@ -177,7 +177,7 @@ def page_3():
             try:
                 df_partido = pd.read_excel(archivo_partido, engine="odf")
                 st.subheader("📋 Estadísticas del partido")
-                st.dataframe(df_partido, use_container_width=True)
+                st.dataframe(df_partido, width='stretch')
 
             
             # PODEMOS DARLE LOGICA PARA QUE MUESTRE LAS ESTADÍSTICAS DE LOS JUGADORES QUE ELIJAMOS
@@ -260,7 +260,7 @@ def page_3():
             })
 
             st.markdown("### ✏️ Introducir estadísticas individuales")
-            df_editado = st.data_editor(df_manual, num_rows="fixed", use_container_width=True)
+            df_editado = st.data_editor(df_manual, num_rows="fixed", width='stretch')
 
             
             submitted = st.form_submit_button("✅ Guardar partido")
@@ -282,7 +282,7 @@ def page_3():
                     df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / POSIBLES_MINUTOS * 100).round(2)
                     
                     st.success(f"{resultado} ✅ Guardado correctamente")
-                    st.dataframe(df_editado, use_container_width=True)
+                    st.dataframe(df_editado, width='stretch')
 
                     csv = df_editado.to_csv(index=False).encode("utf-8")
                     st.download_button(
