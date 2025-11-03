@@ -1,9 +1,16 @@
 import streamlit as st
 import pandas as pd
+from pathlib import Path
+import os
+from datetime import datetime
 
 TU_EQUIPO = "Nules Benj 'A'"
 MAX_TITULARES = 8
 POSIBLES_MINUTOS = 50
+
+CARPETA_BASE = Path(__file__).parent
+CARPETA_PARTIDOS = CARPETA_BASE/"partidos"
+CARPETA_PARTIDOS.mkdir(exist_ok=True)
 
 columnas_datos_individuales = [
     "CONVOCADO", "% CONVOCADO", "TITULAR", "% TITULAR", "SUPLENTE", "% SUPLENTE",
@@ -242,6 +249,10 @@ def page_3():
             st.warning(f"⚠️ Hay más de {MAX_TITULARES} titulares ({num_titulares}). Revisa la convocatoria.")
 
         with st.form("form_partido_manual"):
+            fecha_partido = st.date_input("📅 Fecha del partido",
+                                  value=datetime.today(),
+                                  help="Selecciona la fecha en que se jugó el partido")
+            fecha_str = fecha_partido.strftime("%Y-%m-%d")
             rival = st.text_input("🏟️ Rival", value=st.session_state.get("rival",""))
             local_visitante = st.toggle("Tu equipo es el local?", value=st.session_state.get("local_visitante", False))
             goles_a_favor = st.number_input("⚽ Goles a favor", min_value=0, step=1, value=st.session_state.get("goles_a_favor",0))
@@ -281,20 +292,55 @@ def page_3():
                     df_editado["TOTAL MINUTOS JUGADOS"] = df_editado["MINUTOS 1a PARTE"] + df_editado["MINUTOS 2a PARTE"]
                     df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / POSIBLES_MINUTOS * 100).round(2)
                     
+                    CARPETA_PARTIDOS = Path(__file__).parent / "partidos"
+                    CARPETA_PARTIDOS.mkdir(exist_ok=True)
+                    nombre_archivo = f"estadisticas_{rival.replace(' ', '_')}_{fecha_str}.csv"
+                    ruta_archivo = CARPETA_PARTIDOS / nombre_archivo
+
+
+                    df_editado.to_csv(ruta_archivo, index=False, encoding="utf-8")
+
                     st.success(f"{resultado} ✅ Guardado correctamente")
                     st.dataframe(df_editado, width='stretch')
 
-                    csv = df_editado.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "📤 Descargar archivo del partido",
-                        data=csv,
-                        file_name=f"estadisticas_{rival}.csv",
-                        mime="text/csv"
-                    )
-
-
 def page_4():
-    pass
+    st.header("📜 Histórico de partidos")
+    CARPETA_PARTIDOS = Path(__file__).parent / "partidos"
+    CARPETA_PARTIDOS.mkdir(exist_ok=True)
+    archivos = CARPETA_PARTIDOS.glob("*.csv")
+    
+    if not archivos:
+        st.info("📁 No hay partidos guardados todavía. Guarda un partido desde la pestaña 'Estadísticas por partido'.")
+        return
+    
+    resumen_partidos = []
+    dfs_partidos = {}
+    for archivo in archivos:
+        try:
+            df = pd.read_csv(archivo)
+            dfs_partidos[archivo.name] = df
+
+            nombre_limpio = archivo.stem.replace("estadisticas_","").replace("_"," ")
+            partes = nombre_limpio.split(" ")
+            rival = partes[0]
+            fecha = partes[1]
+            goles_a_favor = df["GOL"][df["GOL"] > 0].sum()
+            goles_en_contra = abs(df["GOL"][df["GOL"] < 0].sum())
+            resultado = "✅ Victoria" if goles_a_favor > goles_en_contra else \
+                    "➖ Empate" if goles_a_favor == goles_en_contra else "❌ Derrota"
+            resumen_partidos.append({
+                "Fecha": fecha,
+                "Rival": rival,
+                "Resultado": resultado,
+            })
+
+        except Exception as e:
+            st.error(f"⚠️ Error al leer el archivo {archivo.name}: {e}")
+
+    df_resumen = pd.DataFrame(resumen_partidos)
+    df_resumen["Fecha"] = pd.to_datetime(df_resumen["Fecha"], errors="coerce").dt.date
+    df_resumen = df_resumen.sort_values("Fecha", ascending=False)
+    st.write(df_resumen)
 
 
 pg = st.navigation({
