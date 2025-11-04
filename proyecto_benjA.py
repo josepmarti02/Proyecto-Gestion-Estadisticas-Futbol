@@ -268,6 +268,8 @@ def page_3():
                 "ASIST":[0] * len(jugadores),
                 "MINUTOS 1a PARTE":[0] * len(jugadores),
                 "MINUTOS 2a PARTE":[0] * len(jugadores),
+                
+
             })
 
             st.markdown("### ✏️ Introducir estadísticas individuales")
@@ -291,7 +293,7 @@ def page_3():
                 else:
                     df_editado["TOTAL MINUTOS JUGADOS"] = df_editado["MINUTOS 1a PARTE"] + df_editado["MINUTOS 2a PARTE"]
                     df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / POSIBLES_MINUTOS * 100).round(2)
-                    
+                    df_editado.loc[0,"LOCAL"] = "Sí" if local_visitante else "No"
                     CARPETA_PARTIDOS = Path(__file__).parent / "partidos"
                     CARPETA_PARTIDOS.mkdir(exist_ok=True)
                     nombre_archivo = f"estadisticas_{rival.replace(' ', '_')}_{fecha_str}.csv"
@@ -314,24 +316,35 @@ def page_4():
         return
     
     resumen_partidos = []
-    dfs_partidos = {}
     for archivo in archivos:
         try:
             df = pd.read_csv(archivo)
-            dfs_partidos[archivo.name] = df
-
-            nombre_limpio = archivo.stem.replace("estadisticas_","").replace("_"," ")
-            partes = nombre_limpio.split(" ")
+            nombre_limpio = archivo.stem.replace("estadisticas_","")
+            partes = nombre_limpio.split("_")
+            st.write(partes)
             rival = partes[0]
             fecha = partes[1]
             goles_a_favor = df["GOL"][df["GOL"] > 0].sum()
             goles_en_contra = abs(df["GOL"][df["GOL"] < 0].sum())
-            resultado = "✅ Victoria" if goles_a_favor > goles_en_contra else \
-                    "➖ Empate" if goles_a_favor == goles_en_contra else "❌ Derrota"
+            resultado = ("✅ Victoria" if goles_a_favor > goles_en_contra else
+                         "➖ Empate" if goles_a_favor == goles_en_contra else 
+                         "❌ Derrota"
+                         )
+            es_local = False
+            if "LOCAL" in df.columns and pd.notna(df.loc[0,"LOCAL"]):
+                valor_local = str(df.loc[0,"LOCAL"]).strip().lower()
+                es_local = valor_local in ["si","sí","true"]
+            if es_local:
+                marcador = f"{TU_EQUIPO} {int(goles_a_favor)} - {int(goles_en_contra)} {rival}"
+            else:
+                marcador = f"{rival} {int(goles_en_contra)} - {int(goles_a_favor)} {TU_EQUIPO}"
+            
             resumen_partidos.append({
+                "Archivo": archivo,
                 "Fecha": fecha,
                 "Rival": rival,
                 "Resultado": resultado,
+                "Marcador" : marcador,
             })
 
         except Exception as e:
@@ -340,7 +353,19 @@ def page_4():
     df_resumen = pd.DataFrame(resumen_partidos)
     df_resumen["Fecha"] = pd.to_datetime(df_resumen["Fecha"], errors="coerce").dt.date
     df_resumen = df_resumen.sort_values("Fecha", ascending=False)
-    st.write(df_resumen)
+    st.subheader("📅 Partidos jugados")
+    st.dataframe(df_resumen)
+
+    partidos_opciones = [f"{row.Fecha} - {row.Rival}" for _,row in df_resumen.iterrows()]
+    partido_seleccionado = st.selectbox("🔍 Selecciona un partido para ver detalles", partidos_opciones)
+    if partido_seleccionado:
+        fila = df_resumen.iloc[partidos_opciones.index(partido_seleccionado)]
+        archivo_detalle = fila["Archivo"]
+        df_detalle = pd.read_csv(archivo_detalle)
+
+        st.markdown(f"### 📊 Detalles del partido contra **{fila['Rival']}** ({fila['Fecha']})")
+        st.dataframe(df_detalle, width="stretch")
+        st.info(f"📍 **Marcador:** {fila['Marcador']}")
 
 
 pg = st.navigation({
