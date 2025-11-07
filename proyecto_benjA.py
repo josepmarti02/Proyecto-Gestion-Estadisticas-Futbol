@@ -86,9 +86,16 @@ if 'df' not in st.session_state:
 def page_1():
     st.subheader("Estadísticas del equipo")
 
-    archivo_subido = st.file_uploader("Sube el archivo de estadísticas", type=["ods"])
+    archivo_subido = st.file_uploader("Sube el archivo de estadísticas", type=["ods", "csv"])
     if archivo_subido:
-        st.session_state['df'] = pd.read_excel(archivo_subido, engine="odf")
+        extension = Path(archivo_subido.name).suffix.lower()
+        if extension == ".ods":
+            st.session_state['df'] = pd.read_excel(archivo_subido, engine="odf")
+        elif extension == ".csv":
+            st.session_state['df'] = pd.read_csv(archivo_subido)
+        else:
+            st.error("⚠️ Tipo de archivo no compatible. Usa .ods o .csv")
+
     
     df = st.session_state['df']
     if df.empty:
@@ -176,20 +183,73 @@ def page_3():
     with tab1:
         st.subheader("📤 Subir archivo de partido")    
         archivo_partido = st.file_uploader(
-            "Sube un archivo con las estadísticas de un partido (.ods)",
-            type="ods",
+            "Sube un archivo con las estadísticas de un partido (.ods o .csv)",
+            type=["ods","csv"],
             key = "partido_uploader"
         )
         if archivo_partido:
             try:
-                df_partido = pd.read_excel(archivo_partido, engine="odf")
+                extension = Path(archivo_partido.name).suffix.lower()
+                if extension == ".ods":           
+                    df_partido = pd.read_excel(archivo_partido, engine="odf")
+                elif extension == ".csv":           
+                    df_partido = pd.read_csv(archivo_partido)
+                else:
+                    st.error("⚠️ Tipo de archivo no compatible. Usa .ods o .csv")
+                    return
+                
+                
                 st.subheader("📋 Estadísticas del partido")
                 st.dataframe(df_partido, width='stretch')
 
-            
-            # PODEMOS DARLE LOGICA PARA QUE MUESTRE LAS ESTADÍSTICAS DE LOS JUGADORES QUE ELIJAMOS
-            # PERO DE MOMENTO LO DEJAMOS PORQUE PUEDEN SER MUY VARIADOS LOS ARCHIVOS. 
-            # NOS CENTRAMOS EN LA ENTRADA MANUAL
+                nombre_original = Path(archivo_partido.name).stem
+                formato_correcto = nombre_original.startswith("estadisticas_") and "_" in nombre_original
+                if formato_correcto:
+                    nombre_guardado = Path(archivo_partido.name).name
+                    st.info(f"📁 Archivo detectado en formato correcto")
+
+                else: 
+                    st.warning("⚠️ El archivo no sigue el formato esperado (`estadisticas_<rival>_<fecha>.csv`).")
+                    rival_manual = st.text_input("🏟️ Introduce el nombre del rival:")
+                    fecha_manual = st.date_input("📅 Fecha del partido:", value=datetime.today())
+                    fecha_str = fecha_manual.strftime("%Y-%m-%d")
+
+                    if rival_manual:
+                        nombre_guardado = f"estadisticas_{rival_manual.replace(' ', '_')}_{fecha_str}.csv"
+                    else:
+                        nombre_guardado = None
+
+                editar = st.checkbox("✏️ Editar archivo")
+                if editar:
+                    st.markdown("### 🔧 Edita los datos del partido si es necesario")
+                    df_editado = st.data_editor(df_partido, width="stretch")
+                    guardar = st.button("💾 Guardar cambios y sobrescribir")
+                    if guardar:
+                        if not nombre_guardado:
+                            st.error("❌ Introduce un nombre de rival válido antes de guardar.")
+                        else:
+                            ruta_guardado = CARPETA_PARTIDOS/nombre_guardado
+                            if ruta_guardado.exists():
+                                st.warning(f"⚠️ Ya existe un archivo llamado '{ruta_guardado.name}'. Se sobrescribirá al guardar.")
+                                
+                            df_editado.to_csv(ruta_guardado, index=False, encoding="utf-8")
+                            st.success(f"✅ Archivo actualizado correctamente en '{ruta_guardado.name}'")
+                            st.rerun()
+
+
+                else:
+                    guardar = st.button("📦 Guardar partido sin editar")
+                    if guardar:
+                        if not nombre_guardado:
+                            st.error("❌ Introduce un nombre de rival válido antes de guardar.")
+                        else:
+                            ruta_guardado = CARPETA_PARTIDOS / nombre_guardado
+                            if ruta_guardado.exists():
+                                st.warning(f"⚠️ Ya existe un archivo llamado '{ruta_guardado.name}'. Se sobrescribirá al guardar.")
+
+                            df_partido.to_csv(ruta_guardado, index=False, encoding="utf-8")
+                            st.success(f"✅ Archivo guardado en '{ruta_guardado.name}'")
+                            st.rerun()
             
             except Exception as e:
                 st.error(f"Error al leer el archivo")
@@ -261,9 +321,9 @@ def page_3():
 
             df_manual = pd.DataFrame({
                 "JUGADOR":jugadores,
-                "CONVOCADO":[1 if j not in no_convocados else 0 for j in jugadores],
-                "TITULAR":[1 if j in titulares else 0 for j in jugadores],
-                "SUPLENTE":[1 if j in suplentes else 0 for j in jugadores],
+                "CONVOCADO":["SÍ" if j not in no_convocados else "NO" for j in jugadores],
+                "TITULAR":["SÍ" if j in titulares else "NO" for j in jugadores],
+                "SUPLENTE":["SÍ" if j in suplentes else "NO" for j in jugadores],
                 "GOL": [0] * len(jugadores),
                 "ASIST":[0] * len(jugadores),
                 "MINUTOS 1a PARTE":[0] * len(jugadores),
@@ -294,11 +354,11 @@ def page_3():
                     df_editado["TOTAL MINUTOS JUGADOS"] = df_editado["MINUTOS 1a PARTE"] + df_editado["MINUTOS 2a PARTE"]
                     df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / POSIBLES_MINUTOS * 100).round(2)
                     df_editado.loc[0,"LOCAL"] = "Sí" if local_visitante else "No"
-                    CARPETA_PARTIDOS = Path(__file__).parent / "partidos"
-                    CARPETA_PARTIDOS.mkdir(exist_ok=True)
                     nombre_archivo = f"estadisticas_{rival.replace(' ', '_')}_{fecha_str}.csv"
                     ruta_archivo = CARPETA_PARTIDOS / nombre_archivo
 
+                    if ruta_archivo.exists():
+                         st.warning(f"⚠️ Ya existe un archivo llamado '{ruta_archivo.name}'. Se sobrescribirá al guardar.")
 
                     df_editado.to_csv(ruta_archivo, index=False, encoding="utf-8")
 
@@ -307,23 +367,51 @@ def page_3():
 
 def page_4():
     st.header("📜 Histórico de partidos")
-    CARPETA_PARTIDOS = Path(__file__).parent / "partidos"
-    CARPETA_PARTIDOS.mkdir(exist_ok=True)
-    archivos = CARPETA_PARTIDOS.glob("*.csv")
-    
-    if not archivos:
+    todos_los_csv = list(CARPETA_PARTIDOS.glob("*.csv"))
+    archivos_validos =  [f for f in todos_los_csv if f.stem.startswith("estadisticas_") and "_" in f.stem]    
+    archivos_invalidos = [f for f in todos_los_csv if f not in archivos_validos]
+
+    if archivos_invalidos:
+        with st.expander("⚠️ Archivos no válidos detectados en la carpeta 'partidos'"):
+            archivo_invalido = st.selectbox("📂 Selecciona un archivo para revisar:", [f.name for f in archivos_invalidos], index=None)
+            if archivo_invalido:
+                ruta_invalida = next(f for f in archivos_invalidos if f.name == archivo_invalido)
+                try:
+                    df_preview = pd.read_csv(ruta_invalida)
+                    st.markdown(f"### 👀 Vista previa de **{archivo_invalido}**")
+                    st.dataframe(df_preview, width="stretch")
+                    es_partido = st.toggle("El archivo seleccionado son las estadísticas de un partido", value=False)
+                    if es_partido:
+                        rival_nuevo = st.text_input("🏟️ Nombre del rival:")
+                        fecha_nueva = st.date_input("📅 Fecha del partido:", value=datetime.today())
+                        fecha_str = fecha_nueva.strftime("%Y-%m-%d")
+                        if st.button("💾 Renombrar archivo seleccionado"):
+                            nuevo_nombre = f"estadisticas_{rival_nuevo.replace(' ', '_')}_{fecha_str}.csv"
+                            nueva_ruta = CARPETA_PARTIDOS/nuevo_nombre
+                            if nueva_ruta.exists():
+                                st.warning(f"⚠️ Ya existe un archivo llamado '{nuevo_nombre}'. Se sobrescribirá.")
+                            ruta_invalida.rename(nueva_ruta)
+                            st.success(f"✅ Archivo renombrado correctamente como '{nuevo_nombre}'.")
+                            st.rerun()
+
+                except Exception as e:
+                      st.error(f"⚠️ No se pudo leer el archivo '{archivo_invalido}': {type(e).__name__} - {e}")
+
+    if not todos_los_csv:
         st.info("📁 No hay partidos guardados todavía. Guarda un partido desde la pestaña 'Estadísticas por partido'.")
         return
     
     resumen_partidos = []
-    for archivo in archivos:
+    for archivo in archivos_validos:
         try:
             df = pd.read_csv(archivo)
             nombre_limpio = archivo.stem.replace("estadisticas_","")
             partes = nombre_limpio.split("_")
-            st.write(partes)
-            rival = partes[0]
-            fecha = partes[1]
+            
+            rival = partes[:-1]
+            rival = " ".join(rival)
+            fecha = partes[-1]
+            st.write(rival,"->", fecha)
             goles_a_favor = df["GOL"][df["GOL"] > 0].sum()
             goles_en_contra = abs(df["GOL"][df["GOL"] < 0].sum())
             resultado = ("✅ Victoria" if goles_a_favor > goles_en_contra else
@@ -340,7 +428,7 @@ def page_4():
                 marcador = f"{rival} {int(goles_en_contra)} - {int(goles_a_favor)} {TU_EQUIPO}"
             
             resumen_partidos.append({
-                "Archivo": archivo,
+                "Archivo": str(archivo),
                 "Fecha": fecha,
                 "Rival": rival,
                 "Resultado": resultado,
@@ -357,10 +445,10 @@ def page_4():
     st.dataframe(df_resumen)
 
     partidos_opciones = [f"{row.Fecha} - {row.Rival}" for _,row in df_resumen.iterrows()]
-    partido_seleccionado = st.selectbox("🔍 Selecciona un partido para ver detalles", partidos_opciones)
+    partido_seleccionado = st.selectbox("🔍 Selecciona un partido para ver detalles", partidos_opciones, index=None)
     if partido_seleccionado:
         fila = df_resumen.iloc[partidos_opciones.index(partido_seleccionado)]
-        archivo_detalle = fila["Archivo"]
+        archivo_detalle = Path(fila["Archivo"])
         df_detalle = pd.read_csv(archivo_detalle)
 
         st.markdown(f"### 📊 Detalles del partido contra **{fila['Rival']}** ({fila['Fecha']})")
