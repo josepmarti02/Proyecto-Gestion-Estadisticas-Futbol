@@ -187,6 +187,31 @@ def page_3():
             type=["ods","csv"],
             key = "partido_uploader"
         )
+        
+        if st.session_state.get("mostrar_confirmacion", False):
+            ruta_guardado = Path(st.session_state["archivo_a_guardar"]["ruta"])
+            df_guardar = pd.DataFrame(st.session_state["archivo_a_guardar"]["df"])
+            st.warning(f"⚠️ Ya existe un archivo llamado '{ruta_guardado.name}'. ¿Quieres sobrescribirlo?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Sobrescribir archivo"):
+                                        df_guardar.to_csv(ruta_guardado, index=False, encoding="utf-8")
+                                        st.success(f"✅ Archivo sobrescrito correctamente en '{ruta_guardado.name}'")
+                                        st.session_state.pop("archivo_a_guardar", None)
+                                        st.session_state.pop("mostrar_confirmacion", None)
+                                        st.rerun()
+            
+
+            with col2:
+                if st.button("❌ Cancelar"):
+                    st.info("❌ Operación cancelada. El archivo no fue modificado.")
+                    st.session_state.pop("archivo_a_guardar", None)
+                    st.session_state.pop("mostrar_confirmacion", None)
+                    st.rerun()
+            
+            st.dataframe(df_guardar, width="stretch")
+            return
+        
         if archivo_partido:
             try:
                 extension = Path(archivo_partido.name).suffix.lower()
@@ -227,54 +252,40 @@ def page_3():
                     if guardar:
                         if not nombre_guardado:
                             st.error("❌ Introduce un nombre de rival válido antes de guardar.")
+                            return
                         else:
                             ruta_guardado = CARPETA_PARTIDOS/nombre_guardado
                             st.session_state['archivo_a_guardar'] = {
                                 'ruta': str(ruta_guardado),
                                 'df' : df_editado.to_dict(orient='list')
                             }
-                            if Path(ruta_guardado).exists():
-                                st.warning(f"⚠️ Ya existe un archivo llamado '{ruta_guardado.name}'. Se sobrescribirá al guardar.")
+                            if ruta_guardado.exists():
                                 st.session_state['mostrar_confirmacion'] = True
-                            else:
-                                df_partido.to_csv(ruta_guardado, index=False, encoding="utf-8")
-                                st.success(f"✅ Archivo actualizado correctamente en '{ruta_guardado.name}'")
-                                st.session_state.pop("mostrar_confirmacion", None)
-                                st.session_state.pop("archivo_a_guardar", None)
                                 st.rerun()
-                    if st.session_state.get("mostrar_confirmacion", False):
-                                ruta_guardado = Path(st.session_state["archivo_a_guardar"]["ruta"])
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    if st.button("✅ Sobrescribir archivo"):
-                                        df_guardar = pd.DataFrame(st.session_state["archivo_a_guardar"]["df"])
-                                        df_guardar.to_csv(ruta_guardado, index=False, encoding="utf-8")
-                                        st.success(f"✅ Archivo sobrescrito correctamente en '{ruta_guardado.name}'")
-                                        st.session_state.pop("archivo_a_guardar", None)
-                                        st.session_state.pop("mostrar_confirmacion", None)
-                                        st.rerun()
+                            else:
+                                df_editado.to_csv(ruta_guardado, index=False, encoding="utf-8")
+                                st.success(f"✅ Archivo actualizado correctamente en '{ruta_guardado.name}'")
+                                st.dataframe(df_editado, width="stretch")
                                 
-                                with col2: 
-                                    if st.button("❌ Cancelar"):
-                                        st.info("❌ Operación cancelada. El archivo no fue modificado.")
-                                        st.session_state.pop("archivo_a_guardar", None)
-                                        st.session_state.pop("mostrar_confirmacion", None)
-                                        st.rerun()
-                                
-
                 else:
                     guardar = st.button("📦 Guardar partido sin editar")
                     if guardar:
                         if not nombre_guardado:
                             st.error("❌ Introduce un nombre de rival válido antes de guardar.")
+                            return
                         else:
                             ruta_guardado = CARPETA_PARTIDOS / nombre_guardado
+                            st.session_state["archivo_a_guardar"] = {
+                                "ruta":str(ruta_guardado),
+                                "df": df_partido.to_dict(orient="list")
+                            }
                             if ruta_guardado.exists():
-                                st.warning(f"⚠️ Ya existe un archivo llamado '{ruta_guardado.name}'. Se sobrescribirá al guardar.")
-
-                            df_partido.to_csv(ruta_guardado, index=False, encoding="utf-8")
-                            st.success(f"✅ Archivo guardado en '{ruta_guardado.name}'")
-                            st.rerun()
+                                st.session_state["mostrar_confirmacion"]= True
+                                st.rerun()
+                            else:
+                                df_partido.to_csv(ruta_guardado, index=False, encoding="utf-8")
+                                st.success(f"✅ Archivo guardado en '{ruta_guardado.name}'")
+                                st.dataframe(df_partido, width="stretch")
             
             except Exception as e:
                 st.error(f"Error al leer el archivo")
