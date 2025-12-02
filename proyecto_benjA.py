@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 from pathlib import Path
+import numpy as np
 import os
 from datetime import datetime
 
 TU_EQUIPO = "Nules Benj 'A'"
 MAX_TITULARES = 8
-POSIBLES_MINUTOS = 50
+MINUTOS_PARTIDO = 50
 
 CARPETA_BASE = Path(__file__).parent
 CARPETA_PARTIDOS = CARPETA_BASE/"partidos"
@@ -42,10 +43,10 @@ def estadisticas_generales(df) -> dict:
     total_goles = int(goles_a_favor["GOL"].sum())
     total_asist = int(goles_a_favor["ASIST"].sum())
     total_partidos = int(df["PARTIDOS"].iloc[0])
-    total_gol_en_contra = int(goles_en_contra["GOL"].sum())
-    diferencia_goles =  total_gol_en_contra + total_goles
+    total_gol_en_contra = abs(int(goles_en_contra["GOL"].sum()))
+    diferencia_goles =  total_goles - total_gol_en_contra
     media_a_favor = total_goles/total_partidos
-    media_en_contra = abs(total_gol_en_contra)/total_partidos
+    media_en_contra = total_gol_en_contra/total_partidos
 
     return{
         "Partidos":total_partidos,
@@ -69,6 +70,81 @@ def metricas_extra(df):
     data["PRODUCTIVIDAD OFENSIVA"] = data["GOL"] + data["ASIST"]
     data["EFICIENCIA GOLEADORA"] = data["GOL"] / data["PARTIDOS"][0]
     return data
+
+
+def generar_acumulado_desde_partidos():
+    todos_los_csv = list(CARPETA_PARTIDOS.glob("*.csv"))
+    archivos_validos = [
+        f for f in todos_los_csv if f.stem.startswith("estadisticas_") and "_" in f.stem and "estadisticas_generadas" not in f.name
+    ]
+    if not archivos_validos:
+        return None, "No hay archivos de partidos con formato válido"
+
+    dfs = []
+    for archivo in archivos_validos:
+        try:
+            df = pd.read_csv(archivo)
+            dfs.append(df)
+        except Exception as e:
+            return None, f"Error al leer {archivo.name} : {e}"
+        
+    df_all = pd.concat(dfs, ignore_index=True)
+    jugadores = df_all["JUGADOR"].unique()
+    total_partidos = len(archivos_validos)
+    total_goles_favor = df_all[df_all["GOL"] > 0]["GOL"].sum()
+    total_goles_contra = abs(df_all[df_all["GOL"] < 0]["GOL"].sum())
+    total_asist = df_all["ASIST"].sum()
+    total_min = total_partidos * MINUTOS_PARTIDO
+    
+    acumulado = []
+    for jugador in jugadores:
+        df_j = df_all[df_all["JUGADOR"] == jugador]
+        conv = (df_j["CONVOCADO"] == "SÍ").sum()
+        tit = (df_j["TITULAR"] == "SÍ").sum()
+        sup = (df_j["SUPLENTE"] == "SÍ").sum()
+        gol = df_j["GOL"].sum()
+        asist = df_j["ASIST"].sum()
+        min1 = df_j["MINUTOS 1a PARTE"].sum()
+        min2 = df_j["MINUTOS 2a PARTE"].sum()
+        min_total = min1 + min2
+        pos_min = conv*MINUTOS_PARTIDO
+
+        if gol > 0:
+            pct_gol = round(gol / total_goles_favor * 100, 2) if total_goles_favor > 0 else 0
+        elif gol < 0:
+            pct_gol = round(gol / total_goles_contra * 100, 2) if total_goles_contra > 0 else 0
+        else:
+            pct_gol = 0
+
+        acumulado.append({
+            "JUGADOR": jugador,
+            "CONVOCADO": conv,
+            "% CONVOCADO": round(conv/total_partidos*100,2),
+            "TITULAR": tit,
+            "% TITULAR": round((tit/conv *100) if conv > 0 else 0, 2),
+            "SUPLENTE": sup,
+            "% SUPLENTE": round((sup/conv *100) if conv > 0 else 0, 2),
+            "GOL": gol,
+            "% GOL": pct_gol,
+            "ASIST": asist,
+            "% ASIST": round((asist/total_asist *100) if total_asist > 0 else 0, 2),
+            "MINUTOS 1a PARTE":min1,
+            "MINUTOS 2a PARTE": min2,
+            "TOTAL MINUTOS JUGADOS": min_total,
+            "POSIBLES MINUTOS": pos_min,
+            "% MINUTOS POSIBLES": round((min_total/pos_min *100) if pos_min > 0 else 0, 2),
+            "% MINUTOS TOTALES": round((min_total/total_min *100) if pos_min > 0 else 0, 2),
+            "PARTIDOS": total_partidos,
+            "TOTAL GOLES": total_goles_favor,
+            "TOTAL ASIST": total_asist,
+            "MINUTOS TOTALES": total_min,
+        })
+    
+    df_acum = pd.DataFrame(acumulado)
+    columnas_globales = ["PARTIDOS", "TOTAL GOLES", "TOTAL ASIST", "MINUTOS TOTALES"]
+    df_acum.loc[1:,columnas_globales] = np.nan
+    return df_acum, None
+
 
 st.set_page_config(
     page_title="Proyecto estadísticas benjamín A",
@@ -97,6 +173,40 @@ def page_1():
             st.error("⚠️ Tipo de archivo no compatible. Usa .ods o .csv")
 
     
+    st.markdown(" 🔄 Generar estadísticas acumuladas desde partidos guardados")
+    if st.button("Generar archivo acumulado"):
+        df_acum, err = generar_acumulado_desde_partidos()
+        if err:
+            st.error(err)
+        else:
+            st.session_state['acumulado_generado'] = df_acum
+            st.session_state['mostrar_confirm_guardado'] = True
+            st.rerun()
+    
+    if st.session_state.get("mostrar_confirm_guardado", False):
+        df_acum = st.session_state["acumulado_generado"]
+        st.success("Estadísticas acumuladas generadas. Revisa antes de guardar")
+        st.dataframe(df_acum, width="stretch")
+        st.warning("¿Quieres guardar este archivo? (No sobrescribe el original)")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Guardar archivo generado"):
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                nombre_archivo = f"estadisticas_generadas_{timestamp}.csv"
+                ruta_salida = CARPETA_PARTIDOS/nombre_archivo
+                df_acum.to_csv(ruta_salida, index=False, encoding="utf-8")
+                st.success(f"Archivo guardado como '{ruta_salida.name}'")
+                st.session_state.pop("mostrar_confirm_guardado", None)
+                st.session_state.pop("acumulado_generado", None)
+
+        with col2:
+            if st.button("❌ Cancelar"):
+                st.info("Operación cancelada. No se guardó ningún archivo.")
+                st.session_state.pop("mostrar_confirm_guardado", None)
+                st.session_state.pop("acumulado_generado", None)
+                st.rerun()
+
     df = st.session_state['df']
     if df.empty:
         st.info("📁 Sube un archivo con las estadísticas para ver el resumen")
@@ -112,13 +222,13 @@ def page_1():
        })
         st.dataframe(df_resumen, width="stretch")
 
-    if st.button("🔄 Actualizar datos", help="Pulsar si se ha modificado la base de datos"):
-        st.cache_data.clear()
-        if archivo_subido:
-            st.session_state['df'] = pd.read_excel(archivo_subido, engine="odf")
-        else:
-            st.session_state['df'] = pd.DataFrame()
-        st.rerun()
+    # if st.button("🔄 Actualizar datos", help="Pulsar si se ha modificado la base de datos"):
+    #     st.cache_data.clear()
+    #     if archivo_subido:
+    #         st.session_state['df'] = pd.read_excel(archivo_subido, engine="odf")
+    #     else:
+    #         st.session_state['df'] = pd.DataFrame()
+    #     st.rerun()
 
 
 
@@ -135,6 +245,7 @@ def page_2():
     select_jugador = st.multiselect(
         "Selecciona jugador(es):",
         options=jugadores,
+        default=jugadores,
     )
     if select_jugador:
         df_select_jugadores = data[data["JUGADOR"].isin(select_jugador)]
@@ -380,7 +491,7 @@ def page_3():
                 st.error(f"⚠️ Hay menos de {MAX_TITULARES} jugadores disponibles ({len(jugadores_disponibles)}).")
             else:
 
-                mitad = POSIBLES_MINUTOS/2
+                mitad = MINUTOS_PARTIDO/2
                 invalidos = df_editado[(df_editado["MINUTOS 1a PARTE"] > mitad)| (df_editado["MINUTOS 2a PARTE"]> mitad)]
                 if not invalidos.empty:
                     st.warning("⚠️ Algunos jugadores tienen minutos superiores al máximo permitido por parte.")
@@ -388,7 +499,7 @@ def page_3():
                 
                 else:
                     df_editado["TOTAL MINUTOS JUGADOS"] = df_editado["MINUTOS 1a PARTE"] + df_editado["MINUTOS 2a PARTE"]
-                    df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / POSIBLES_MINUTOS * 100).round(2)
+                    df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / MINUTOS_PARTIDO * 100).round(2)
                     df_editado.loc[0,"LOCAL"] = "Sí" if local_visitante else "No"
                     nombre_archivo = f"estadisticas_{rival.replace(' ', '_')}_{fecha_str}.csv"
                     ruta_archivo = CARPETA_PARTIDOS / nombre_archivo
@@ -404,8 +515,8 @@ def page_3():
 def page_4():
     st.header("📜 Histórico de partidos")
     todos_los_csv = list(CARPETA_PARTIDOS.glob("*.csv"))
-    archivos_validos =  [f for f in todos_los_csv if f.stem.startswith("estadisticas_") and "_" in f.stem]    
-    archivos_invalidos = [f for f in todos_los_csv if f not in archivos_validos]
+    archivos_validos =  [f for f in todos_los_csv if f.stem.startswith("estadisticas_") and "_" in f.stem and "estadisticas_generadas" not in f.name]    
+    archivos_invalidos = [f for f in todos_los_csv if f not in archivos_validos and "estadisticas_generadas" not in f.name]
 
     if archivos_invalidos:
         with st.expander("⚠️ Archivos no válidos detectados en la carpeta 'partidos'"):
