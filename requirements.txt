@@ -3,3 +3,4 @@ pandas
 numpy
 openpyxl
 odfpy
+supabase>=2.0.0
