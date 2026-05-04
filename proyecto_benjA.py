@@ -1,18 +1,7 @@
-import json
 import streamlit as st
 import pandas as pd
-from pathlib import Path
-import numpy as np
 from datetime import datetime
-
-TU_EQUIPO = "Nules Benj 'A'"
-MAX_TITULARES = 8
-MINUTOS_PARTIDO = 50
-
-CARPETA_BASE = Path(__file__).parent
-CARPETA_PARTIDOS = CARPETA_BASE / "partidos"
-CARPETA_PARTIDOS.mkdir(exist_ok=True)
-FICHERO_JUGADORES = CARPETA_BASE / "jugadores.json"
+import db
 
 columnas_datos_individuales = [
     "CONVOCADO", "% CONVOCADO", "TITULAR", "% TITULAR", "SUPLENTE", "% SUPLENTE",
@@ -24,266 +13,212 @@ opciones_ranking = ["GOL", "ASIST", "TOTAL MINUTOS JUGADOS",
                     "EFICIENCIA GOLEADORA"]
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def get_valid_match_files() -> list:
-    """Devuelve la lista de ficheros CSV válidos de partidos."""
-    todos = list(CARPETA_PARTIDOS.glob("*.csv"))
-    return [
-        f for f in todos
-        if f.stem.startswith("estadisticas_")
-        and "_" in f.stem
-        and "estadisticas_generadas" not in f.name
-    ]
-
-
-def load_jugadores() -> list:
-    """Carga la lista de jugadores desde jugadores.json. Devuelve lista vacía si no existe."""
-    if not FICHERO_JUGADORES.exists():
-        return []
-    try:
-        with open(FICHERO_JUGADORES, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def save_jugadores(jugadores: list):
-    """Guarda la lista de jugadores en jugadores.json."""
-    with open(FICHERO_JUGADORES, "w", encoding="utf-8") as f:
-        json.dump(jugadores, f, ensure_ascii=False, indent=2)
-
-
-def guardar_partido(df: pd.DataFrame, ruta: Path):
-    """Guarda un DataFrame de partido en la ruta indicada."""
-    df.to_csv(ruta, index=False, encoding="utf-8")
-
-
-# ── Lógica de estadísticas ────────────────────────────────────────────────────
+# ── Funciones puras de estadísticas ──────────────────────────────────────────
 
 def estadisticas_generales(df) -> dict:
     if df.empty:
         return {"Partidos": 0, "Goles a favor": 0, "Asistencias": 0,
                 "Goles en contra": 0, "Diferencia de goles": 0}
-
     data = df.copy()
     for col in ["GOL", "ASIST", "PARTIDOS"]:
         if col not in data.columns:
             data[col] = 0
-
     data["GOL"] = pd.to_numeric(data["GOL"], errors="coerce").fillna(0)
     data["ASIST"] = pd.to_numeric(data["ASIST"], errors="coerce").fillna(0)
-
-    goles_a_favor = data[data["GOL"] >= 0]
-    goles_en_contra = data[data["GOL"] < 0]
-
-    total_goles = int(goles_a_favor["GOL"].sum())
-    total_asist = int(goles_a_favor["ASIST"].sum())
-    total_partidos = int(data["PARTIDOS"].iloc[0])
-    total_gol_en_contra = abs(int(goles_en_contra["GOL"].sum()))
-    diferencia_goles = total_goles - total_gol_en_contra
-    media_a_favor = total_goles / total_partidos if total_partidos else 0
-    media_en_contra = total_gol_en_contra / total_partidos if total_partidos else 0
-
+    total_goles = int(data[data["GOL"] >= 0]["GOL"].sum())
+    total_goles_contra = abs(int(data[data["GOL"] < 0]["GOL"].sum()))
+    total_asist = int(data[data["GOL"] >= 0]["ASIST"].sum())
+    total_partidos = int(pd.to_numeric(data["PARTIDOS"].iloc[0], errors="coerce") or 0)
+    diferencia = total_goles - total_goles_contra
+    media_favor = round(total_goles / total_partidos, 2) if total_partidos else 0
+    media_contra = round(total_goles_contra / total_partidos, 2) if total_partidos else 0
     return {
         "Partidos": total_partidos,
         "Goles a favor": total_goles,
-        "Media goles a favor": media_a_favor,
+        "Media goles a favor": media_favor,
         "Asistencias": total_asist,
-        "Goles en contra": total_gol_en_contra,
-        "Media goles en contra": media_en_contra,
-        "Diferencia de goles": diferencia_goles,
+        "Goles en contra": total_goles_contra,
+        "Media goles en contra": media_contra,
+        "Diferencia de goles": diferencia,
     }
 
 
 def ranking(df, columna, top=3):
     if columna not in df.columns:
         return pd.DataFrame()
-    df_ranking = df[["JUGADOR", columna]].sort_values(by=columna, ascending=False).head(top)
-    df_ranking.columns = ["Jugador", columna]
-    return df_ranking
+    df_r = df[["JUGADOR", columna]].sort_values(by=columna, ascending=False).head(top)
+    df_r.columns = ["Jugador", columna]
+    return df_r
 
 
 def metricas_extra(df):
     data = df.copy()
-    data["PRODUCTIVIDAD OFENSIVA"] = data["GOL"] + data["ASIST"]
-    data["EFICIENCIA GOLEADORA"] = data["GOL"] / data["PARTIDOS"].iloc[0]
+    if "GOL" in data.columns and "ASIST" in data.columns:
+        data["PRODUCTIVIDAD OFENSIVA"] = data["GOL"] + data["ASIST"]
+    if "GOL" in data.columns and "PARTIDOS" in data.columns:
+        partidos = pd.to_numeric(data["PARTIDOS"].iloc[0], errors="coerce") or 1
+        data["EFICIENCIA GOLEADORA"] = (data["GOL"] / partidos).round(2)
     return data
-
-
-def generar_acumulado_desde_partidos():
-    archivos_validos = get_valid_match_files()
-    if not archivos_validos:
-        return None, "No hay archivos de partidos con formato válido"
-
-    dfs = []
-    for archivo in archivos_validos:
-        try:
-            df = pd.read_csv(archivo)
-            dfs.append(df)
-        except Exception as e:
-            return None, f"Error al leer {archivo.name}: {e}"
-
-    df_all = pd.concat(dfs, ignore_index=True)
-    jugadores = df_all["JUGADOR"].unique()
-    total_partidos = len(archivos_validos)
-    total_goles_favor = df_all[df_all["GOL"] > 0]["GOL"].sum()
-    total_goles_contra = abs(df_all[df_all["GOL"] < 0]["GOL"].sum())
-    total_asist = df_all["ASIST"].sum()
-    total_min = total_partidos * MINUTOS_PARTIDO
-
-    acumulado = []
-    for jugador in jugadores:
-        df_j = df_all[df_all["JUGADOR"] == jugador]
-        conv = (df_j["CONVOCADO"] == "SÍ").sum()
-        tit = (df_j["TITULAR"] == "SÍ").sum()
-        sup = (df_j["SUPLENTE"] == "SÍ").sum()
-        gol = df_j["GOL"].sum()
-        asist = df_j["ASIST"].sum()
-        min1 = df_j["MINUTOS 1a PARTE"].sum()
-        min2 = df_j["MINUTOS 2a PARTE"].sum()
-        min_total = min1 + min2
-        pos_min = conv * MINUTOS_PARTIDO
-
-        if gol > 0:
-            pct_gol = round(gol / total_goles_favor * 100, 2) if total_goles_favor > 0 else 0
-        elif gol < 0:
-            pct_gol = round(gol / total_goles_contra * 100, 2) if total_goles_contra > 0 else 0
-        else:
-            pct_gol = 0
-
-        acumulado.append({
-            "JUGADOR": jugador,
-            "CONVOCADO": conv,
-            "% CONVOCADO": round(conv / total_partidos * 100, 2),
-            "TITULAR": tit,
-            "% TITULAR": round((tit / conv * 100) if conv > 0 else 0, 2),
-            "SUPLENTE": sup,
-            "% SUPLENTE": round((sup / conv * 100) if conv > 0 else 0, 2),
-            "GOL": gol,
-            "% GOL": pct_gol,
-            "ASIST": asist,
-            "% ASIST": round((asist / total_asist * 100) if total_asist > 0 else 0, 2),
-            "MINUTOS 1a PARTE": min1,
-            "MINUTOS 2a PARTE": min2,
-            "TOTAL MINUTOS JUGADOS": min_total,
-            "POSIBLES MINUTOS": pos_min,
-            "% MINUTOS POSIBLES": round((min_total / pos_min * 100) if pos_min > 0 else 0, 2),
-            "% MINUTOS TOTALES": round((min_total / total_min * 100) if total_min > 0 else 0, 2),
-            "PARTIDOS": total_partidos,
-            "TOTAL GOLES": total_goles_favor,
-            "TOTAL ASIST": total_asist,
-            "MINUTOS TOTALES": total_min,
-        })
-
-    df_acum = pd.DataFrame(acumulado)
-    columnas_globales = ["PARTIDOS", "TOTAL GOLES", "TOTAL ASIST", "MINUTOS TOTALES"]
-    df_acum.loc[1:, columnas_globales] = np.nan
-    return df_acum, None
 
 
 # ── Configuración de la app ───────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Proyecto estadísticas benjamín A",
+    page_title="Gestión estadísticas fútbol",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.header("Estadísticas Benjamín A 25-26")
 
-if "df" not in st.session_state:
-    st.session_state["df"] = pd.DataFrame()
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def mostrar_login():
+    st.title("⚽ Gestión de estadísticas")
+    st.markdown("Inicia sesión para acceder a tu equipo.")
+    tab_login, tab_registro = st.tabs(["Iniciar sesión", "Crear cuenta"])
+
+    with tab_login:
+        with st.form("form_login"):
+            email = st.text_input("Email")
+            password = st.text_input("Contraseña", type="password")
+            if st.form_submit_button("Entrar"):
+                if email and password:
+                    ok, msg = db.sign_in(email, password)
+                    if ok:
+                        st.rerun()
+                    else:
+                        st.error(f"Error al iniciar sesión: {msg}")
+                else:
+                    st.warning("Rellena email y contraseña.")
+
+    with tab_registro:
+        with st.form("form_registro"):
+            email_r = st.text_input("Email")
+            password_r = st.text_input("Contraseña", type="password")
+            password_r2 = st.text_input("Repite la contraseña", type="password")
+            if st.form_submit_button("Crear cuenta"):
+                if not email_r or not password_r:
+                    st.warning("Rellena todos los campos.")
+                elif password_r != password_r2:
+                    st.error("Las contraseñas no coinciden.")
+                elif len(password_r) < 6:
+                    st.error("La contraseña debe tener al menos 6 caracteres.")
+                else:
+                    ok, msg = db.sign_up(email_r, password_r)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+
+
+# ── Sidebar: selector de equipo ───────────────────────────────────────────────
+
+def sidebar_equipo() -> bool:
+    """Gestiona la selección de equipo en el sidebar. Devuelve True si hay equipo activo."""
+    user = db.current_user()
+    with st.sidebar:
+        st.markdown(f"👤 **{user['email']}**")
+        if st.button("Cerrar sesión", use_container_width=True):
+            db.sign_out()
+            st.rerun()
+        st.divider()
+
+        equipos = db.list_teams()
+
+        if not equipos:
+            st.info("No tienes ningún equipo. Crea uno:")
+            with st.form("form_crear_equipo"):
+                nombre = st.text_input("Nombre del equipo")
+                categoria = st.text_input("Categoría", value="Benjamín")
+                max_tit = st.number_input("Titulares por partido", min_value=5, max_value=11, value=8)
+                minutos = st.number_input("Minutos por partido", min_value=20, max_value=90, value=50)
+                if st.form_submit_button("Crear equipo"):
+                    if nombre.strip():
+                        equipo = db.create_team(nombre.strip(), categoria.strip(), int(max_tit), int(minutos))
+                        if equipo:
+                            st.session_state["current_team"] = equipo
+                            st.rerun()
+                        else:
+                            st.error("No se pudo crear el equipo.")
+                    else:
+                        st.warning("El nombre no puede estar vacío.")
+            return False
+
+        nombres = [e["name"] for e in equipos]
+        equipo_actual = st.session_state.get("current_team")
+        idx_default = 0
+        if equipo_actual:
+            ids = [e["id"] for e in equipos]
+            if equipo_actual["id"] in ids:
+                idx_default = ids.index(equipo_actual["id"])
+
+        seleccion = st.selectbox("⚽ Equipo", nombres, index=idx_default)
+        equipo_sel = next(e for e in equipos if e["name"] == seleccion)
+        if not equipo_actual or equipo_actual["id"] != equipo_sel["id"]:
+            st.session_state["current_team"] = equipo_sel
+
+        with st.expander("➕ Nuevo equipo"):
+            nombre_n = st.text_input("Nombre", key="nombre_nuevo_equipo")
+            cat_n = st.text_input("Categoría", value="Benjamín", key="cat_nuevo_equipo")
+            max_n = st.number_input("Titulares", min_value=5, max_value=11, value=8, key="max_nuevo_equipo")
+            min_n = st.number_input("Minutos", min_value=20, max_value=90, value=50, key="min_nuevo_equipo")
+            if st.button("Crear equipo", key="btn_nuevo_equipo"):
+                if nombre_n.strip():
+                    nuevo = db.create_team(nombre_n.strip(), cat_n.strip(), int(max_n), int(min_n))
+                    if nuevo:
+                        st.session_state["current_team"] = nuevo
+                        st.rerun()
+                else:
+                    st.warning("El nombre no puede estar vacío.")
+
+        return True
+
+
+def get_equipo() -> dict:
+    return st.session_state.get("current_team", {})
 
 
 # ── Páginas ───────────────────────────────────────────────────────────────────
 
 def page_1():
-    st.subheader("Estadísticas del equipo")
+    equipo = get_equipo()
+    st.subheader(f"📊 Estadísticas de {equipo['name']}")
 
-    archivo_subido = st.file_uploader("Sube el archivo de estadísticas", type=["ods", "csv"])
-    if archivo_subido:
-        extension = Path(archivo_subido.name).suffix.lower()
-        if extension == ".ods":
-            st.session_state["df"] = pd.read_excel(archivo_subido, engine="odf")
-        elif extension == ".csv":
-            st.session_state["df"] = pd.read_csv(archivo_subido)
-        else:
-            st.error("Tipo de archivo no compatible. Usa .ods o .csv")
-
-    st.markdown("🔄 Generar estadísticas acumuladas desde partidos guardados")
-    if st.button("Generar archivo acumulado"):
-        df_acum, err = generar_acumulado_desde_partidos()
-        if err:
-            st.error(err)
-        else:
-            st.session_state["acumulado_generado"] = df_acum
-            st.session_state["mostrar_confirm_guardado"] = True
-            st.rerun()
-
-    if st.session_state.get("mostrar_confirm_guardado", False):
-        df_acum = st.session_state["acumulado_generado"]
-        st.success("Estadísticas acumuladas generadas. Revisa antes de guardar.")
-        st.dataframe(df_acum, width="stretch")
-        st.warning("¿Quieres guardar este archivo? (No sobrescribe el original)")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Guardar archivo generado"):
-                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                nombre_archivo = f"estadisticas_generadas_{timestamp}.csv"
-                ruta_salida = CARPETA_PARTIDOS / nombre_archivo
-                guardar_partido(df_acum, ruta_salida)
-                st.success(f"Archivo guardado como '{ruta_salida.name}'")
-                st.session_state.pop("mostrar_confirm_guardado", None)
-                st.session_state.pop("acumulado_generado", None)
-        with col2:
-            if st.button("❌ Cancelar"):
-                st.session_state.pop("mostrar_confirm_guardado", None)
-                st.session_state.pop("acumulado_generado", None)
-                st.rerun()
-
-    df = st.session_state["df"]
+    df = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
     if df.empty:
-        st.info("📁 Sube un archivo con las estadísticas para ver el resumen")
+        st.info("📁 Aún no hay partidos registrados. Ve a **Añadir partido** para empezar.")
         return
 
-    resumen_estadisticas = estadisticas_generales(df)
-    with st.expander("Resumen estadísticas equipo"):
-        df_resumen = pd.DataFrame({
-            "Estadística": resumen_estadisticas.keys(),
-            "Total": resumen_estadisticas.values(),
-        })
+    with st.expander("📋 Resumen del equipo", expanded=True):
+        resumen = estadisticas_generales(df)
+        df_resumen = pd.DataFrame({"Estadística": resumen.keys(), "Total": resumen.values()})
         st.dataframe(df_resumen, width="stretch")
+
+    st.subheader("📈 Estadísticas acumuladas")
+    st.dataframe(df, width="stretch")
 
 
 def page_2():
-    st.header("Estadísticas individuales")
-    df = st.session_state["df"]
+    equipo = get_equipo()
+    st.header("🪄 Estadísticas individuales")
+
+    df = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
     if df.empty:
-        st.info("📁 Sube un archivo con las estadísticas para ver el resumen")
+        st.info("📁 Aún no hay partidos registrados.")
         return
-    data = df.copy()
-    data.columns = [col.strip() for col in data.columns]
 
-    jugadores = data["JUGADOR"].dropna().astype(str).tolist()
-    select_jugador = st.multiselect(
-        "Selecciona jugador(es):",
-        options=jugadores,
-        default=jugadores,
-    )
+    jugadores = df["JUGADOR"].dropna().astype(str).tolist()
+    select_jugador = st.multiselect("Selecciona jugador(es):", options=jugadores, default=jugadores)
     if select_jugador:
-        df_select_jugadores = data[data["JUGADOR"].isin(select_jugador)]
-        columnas = [col for col in columnas_datos_individuales if col in data.columns]
-        df_mostrar = df_select_jugadores[["JUGADOR"] + columnas]
-        st.dataframe(df_mostrar, width="stretch")
+        df_sel = df[df["JUGADOR"].isin(select_jugador)]
+        columnas = [c for c in columnas_datos_individuales if c in df.columns]
+        st.dataframe(df_sel[["JUGADOR"] + columnas], width="stretch")
     else:
-        st.warning("Selecciona al menos un jugador para ver sus estadísticas")
+        st.warning("Selecciona al menos un jugador.")
 
-    data = metricas_extra(data)
-    seleccion_rankings = st.multiselect("🏆 Mostrar ránkings", options=opciones_ranking)
+    df_extra = metricas_extra(df)
+    seleccion_rankings = st.multiselect("🏆 Mostrar rankings", options=opciones_ranking)
     if seleccion_rankings:
         num_cols = min(len(seleccion_rankings), 3)
         for i in range(0, len(seleccion_rankings), 3):
@@ -292,411 +227,329 @@ def page_2():
                 if i + j < len(seleccion_rankings):
                     metrica = seleccion_rankings[i + j]
                     col.markdown(f"🏅 {metrica}")
-                    df_rank = ranking(data, metrica)
-                    col.dataframe(df_rank, width="stretch")
+                    col.dataframe(ranking(df_extra, metrica), width="stretch")
     else:
         st.warning("Selecciona al menos un ranking para mostrar resultados.")
 
 
 def page_3():
+    equipo = get_equipo()
+    MAX_TITULARES = equipo["max_titulares"]
+    MINUTOS_PARTIDO = equipo["minutos_partido"]
+
     st.header("📅 Añadir partido")
 
-    tab1, tab2 = st.tabs(["📤 Subir archivo de partido", "✍️ Añadir estadísticas manualmente"])
+    players_data = db.list_players(equipo["id"])
+    if not players_data:
+        st.warning("⚠️ No hay jugadores en la plantilla. Ve a **Plantilla** para añadirlos.")
+        return
 
-    # ── Tab 1: subir fichero ──────────────────────────────────────────────────
-    with tab1:
-        st.subheader("📤 Subir archivo de partido")
-        archivo_partido = st.file_uploader(
-            "Sube un archivo con las estadísticas de un partido (.ods o .csv)",
-            type=["ods", "csv"],
-            key="partido_uploader",
+    jugadores = [p["name"] for p in players_data]
+    player_ids = {p["name"]: p["id"] for p in players_data}
+
+    for key in ["no_convocados", "suplentes"]:
+        st.session_state.setdefault(key, [])
+    for key in ["goles_a_favor", "goles_en_contra"]:
+        st.session_state.setdefault(key, 0)
+    st.session_state.setdefault("rival", "")
+    st.session_state.setdefault("local_visitante", False)
+
+    st.markdown("### 👥 Convocatoria y alineación")
+
+    no_convocados = st.multiselect(
+        "Jugadores no convocados",
+        options=jugadores,
+        default=[j for j in st.session_state["no_convocados"] if j in jugadores],
+        key="multiselect_no_convocados",
+    )
+
+    jugadores_disponibles = [j for j in jugadores if j not in no_convocados]
+    max_suplentes = max(len(jugadores_disponibles) - MAX_TITULARES, 0)
+    suplentes_validos = [j for j in st.session_state["suplentes"] if j in jugadores_disponibles]
+    if max_suplentes == 0:
+        suplentes_validos = []
+    elif len(suplentes_validos) > max_suplentes:
+        suplentes_validos = suplentes_validos[:max_suplentes]
+
+    if max_suplentes == 0:
+        st.info("ℹ️ No hay margen para suplentes")
+        suplentes = []
+    else:
+        suplentes = st.multiselect(
+            "Jugadores suplentes",
+            options=jugadores_disponibles,
+            default=suplentes_validos,
+            max_selections=max_suplentes,
+            key="multiselect_suplentes",
         )
 
-        # Confirmación de sobreescritura
-        if st.session_state.get("mostrar_confirmacion", False):
-            ruta_guardado = Path(st.session_state["archivo_a_guardar"]["ruta"])
-            df_guardar = pd.DataFrame(st.session_state["archivo_a_guardar"]["df"])
-            st.warning(f"⚠️ Ya existe '{ruta_guardado.name}'. ¿Quieres sobrescribirlo?")
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("✅ Sobrescribir archivo"):
-                    guardar_partido(df_guardar, ruta_guardado)
-                    st.success(f"✅ Archivo sobrescrito correctamente: '{ruta_guardado.name}'")
-                    st.session_state.pop("archivo_a_guardar", None)
-                    st.session_state.pop("mostrar_confirmacion", None)
-                    st.rerun()
-            with col2:
-                if st.button("❌ Cancelar"):
-                    st.session_state.pop("archivo_a_guardar", None)
-                    st.session_state.pop("mostrar_confirmacion", None)
-                    st.rerun()
-            st.dataframe(df_guardar, width="stretch")
-            return
+    if st.button("🔄 Actualizar convocatoria"):
+        st.session_state["no_convocados"] = no_convocados
+        st.session_state["suplentes"] = suplentes
+        st.success("✅ Convocatoria actualizada.")
+        st.rerun()
 
-        if archivo_partido:
-            try:
-                extension = Path(archivo_partido.name).suffix.lower()
-                if extension == ".ods":
-                    df_partido = pd.read_excel(archivo_partido, engine="odf")
-                elif extension == ".csv":
-                    df_partido = pd.read_csv(archivo_partido)
-                else:
-                    st.error("Tipo de archivo no compatible. Usa .ods o .csv")
-                    return
+    titulares = [j for j in jugadores_disponibles if j not in suplentes]
+    num_titulares = len(titulares)
 
-                st.subheader("📋 Estadísticas del partido")
-                st.dataframe(df_partido, width="stretch")
+    if num_titulares < MAX_TITULARES:
+        st.warning(f"⚠️ Hay {num_titulares} titulares. Se necesitan {MAX_TITULARES}.")
+    elif num_titulares > MAX_TITULARES:
+        st.warning(f"⚠️ Hay {num_titulares} titulares. Máximo {MAX_TITULARES}.")
 
-                nombre_original = Path(archivo_partido.name).stem
-                formato_correcto = nombre_original.startswith("estadisticas_") and "_" in nombre_original
-                if formato_correcto:
-                    nombre_guardado = Path(archivo_partido.name).name
-                    st.info("📁 Archivo detectado en formato correcto")
-                else:
-                    st.warning("⚠️ El archivo no sigue el formato esperado (`estadisticas_<rival>_<fecha>.csv`).")
-                    rival_manual = st.text_input("🏟️ Introduce el nombre del rival:")
-                    fecha_manual = st.date_input("📅 Fecha del partido:", value=datetime.today())
-                    fecha_str = fecha_manual.strftime("%Y-%m-%d")
-                    nombre_guardado = (
-                        f"estadisticas_{rival_manual.replace(' ', '_')}_{fecha_str}.csv"
-                        if rival_manual else None
-                    )
+    st.divider()
 
-                editar = st.checkbox("✏️ Editar archivo")
-                if editar:
-                    st.markdown("### 🔧 Edita los datos del partido si es necesario")
-                    df_editado = st.data_editor(df_partido, width="stretch")
-                    if st.button("💾 Guardar cambios"):
-                        if not nombre_guardado:
-                            st.error("❌ Introduce un nombre de rival válido antes de guardar.")
-                        else:
-                            ruta_guardado = CARPETA_PARTIDOS / nombre_guardado
-                            st.session_state["archivo_a_guardar"] = {
-                                "ruta": str(ruta_guardado),
-                                "df": df_editado.to_dict(orient="list"),
-                            }
-                            if ruta_guardado.exists():
-                                st.session_state["mostrar_confirmacion"] = True
-                                st.rerun()
-                            else:
-                                guardar_partido(df_editado, ruta_guardado)
-                                st.success(f"✅ Archivo guardado en '{ruta_guardado.name}'")
-                                st.dataframe(df_editado, width="stretch")
-                else:
-                    if st.button("📦 Guardar partido sin editar"):
-                        if not nombre_guardado:
-                            st.error("❌ Introduce un nombre de rival válido antes de guardar.")
-                        else:
-                            ruta_guardado = CARPETA_PARTIDOS / nombre_guardado
-                            st.session_state["archivo_a_guardar"] = {
-                                "ruta": str(ruta_guardado),
-                                "df": df_partido.to_dict(orient="list"),
-                            }
-                            if ruta_guardado.exists():
-                                st.session_state["mostrar_confirmacion"] = True
-                                st.rerun()
-                            else:
-                                guardar_partido(df_partido, ruta_guardado)
-                                st.success(f"✅ Archivo guardado en '{ruta_guardado.name}'")
-                                st.dataframe(df_partido, width="stretch")
+    with st.form("form_partido_manual"):
+        fecha_partido = st.date_input("📅 Fecha del partido", value=datetime.today())
+        rival = st.text_input("🏟️ Rival", value=st.session_state.get("rival", ""))
+        local_visitante = st.toggle("¿Tu equipo es el local?", value=st.session_state.get("local_visitante", False))
+        goles_a_favor = st.number_input("⚽ Goles a favor", min_value=0, step=1, value=st.session_state.get("goles_a_favor", 0))
+        goles_en_contra = st.number_input("🥅 Goles en contra", min_value=0, step=1, value=st.session_state.get("goles_en_contra", 0))
 
-            except Exception as e:
-                st.error(f"Error al leer el archivo: {e}")
-
-    # ── Tab 2: entrada manual ─────────────────────────────────────────────────
-    with tab2:
-        st.subheader("✍️ Añadir estadísticas manualmente")
-
-        jugadores = load_jugadores()
-        if not jugadores:
-            st.warning("⚠️ No hay jugadores en la plantilla. Ve a la página **Plantilla** para añadirlos.")
-            return
-
-        for key in ["no_convocados", "suplentes", "rival", "local_visitante", "goles_a_favor", "goles_en_contra"]:
-            st.session_state.setdefault(key, [] if key in ["no_convocados", "suplentes"] else 0)
-
-        st.markdown("### 👥 Convocatoria y alineación")
-
-        no_convocados = st.multiselect(
-            "Jugadores no convocados",
-            options=jugadores,
-            default=[j for j in st.session_state["no_convocados"] if j in jugadores],
-            key="multiselect_no_convocados",
+        resultado = (
+            f"{equipo['name']} {goles_a_favor} - {goles_en_contra} {rival}"
+            if local_visitante
+            else f"{rival} {goles_en_contra} - {goles_a_favor} {equipo['name']}"
         )
 
-        jugadores_disponibles = [j for j in jugadores if j not in no_convocados]
-        max_suplentes = max(len(jugadores_disponibles) - MAX_TITULARES, 0)
-        suplentes_validos = [j for j in st.session_state["suplentes"] if j in jugadores_disponibles]
-        if max_suplentes <= 0:
-            suplentes_validos = []
-        elif len(suplentes_validos) > max_suplentes:
-            suplentes_validos = suplentes_validos[:max_suplentes]
+        df_manual = pd.DataFrame({
+            "JUGADOR":          jugadores,
+            "CONVOCADO":        ["SÍ" if j not in no_convocados else "NO" for j in jugadores],
+            "TITULAR":          ["SÍ" if j in titulares else "NO" for j in jugadores],
+            "SUPLENTE":         ["SÍ" if j in suplentes else "NO" for j in jugadores],
+            "GOL":              [0] * len(jugadores),
+            "ASIST":            [0] * len(jugadores),
+            "MINUTOS 1a PARTE": [0] * len(jugadores),
+            "MINUTOS 2a PARTE": [0] * len(jugadores),
+        })
 
-        if max_suplentes == 0:
-            st.info("ℹ️ No hay margen para suplentes")
-            suplentes = []
+        st.markdown("### ✏️ Estadísticas individuales")
+        df_editado = st.data_editor(df_manual, num_rows="fixed", width="stretch")
+        submitted = st.form_submit_button("✅ Guardar partido")
+
+    if submitted:
+        if not rival.strip():
+            st.error("❌ Introduce el nombre del rival.")
+        elif num_titulares != MAX_TITULARES:
+            st.error(f"⚠️ El número de titulares debe ser exactamente {MAX_TITULARES} (hay {num_titulares}).")
         else:
-            suplentes = st.multiselect(
-                "Jugadores suplentes",
-                options=jugadores_disponibles,
-                default=suplentes_validos,
-                max_selections=max_suplentes,
-                key="multiselect_suplentes",
-            )
-
-        if st.button("🔄 Actualizar convocatoria"):
-            st.session_state["no_convocados"] = no_convocados
-            st.session_state["suplentes"] = suplentes
-            st.success("✅ Convocatoria actualizada correctamente.")
-            st.rerun()
-
-        titulares = [j for j in jugadores_disponibles if j not in suplentes]
-        num_titulares = len(titulares)
-
-        if num_titulares < MAX_TITULARES:
-            st.warning(f"⚠️ Hay menos de {MAX_TITULARES} titulares ({num_titulares}). Faltan jugadores.")
-        elif num_titulares > MAX_TITULARES:
-            st.warning(f"⚠️ Hay más de {MAX_TITULARES} titulares ({num_titulares}). Revisa la convocatoria.")
-
-        st.divider()
-
-        with st.form("form_partido_manual"):
-            fecha_partido = st.date_input("📅 Fecha del partido", value=datetime.today())
-            fecha_str = fecha_partido.strftime("%Y-%m-%d")
-            rival = st.text_input("🏟️ Rival", value=st.session_state.get("rival", ""))
-            local_visitante = st.toggle("¿Tu equipo es el local?", value=st.session_state.get("local_visitante", False))
-            goles_a_favor = st.number_input("⚽ Goles a favor", min_value=0, step=1, value=st.session_state.get("goles_a_favor", 0))
-            goles_en_contra = st.number_input("🥅 Goles en contra", min_value=0, step=1, value=st.session_state.get("goles_en_contra", 0))
-            resultado = (
-                f"{TU_EQUIPO} {goles_a_favor} - {goles_en_contra} {rival}"
-                if local_visitante
-                else f"{rival} {goles_en_contra} - {goles_a_favor} {TU_EQUIPO}"
-            )
-
-            df_manual = pd.DataFrame({
-                "JUGADOR": jugadores,
-                "CONVOCADO": ["SÍ" if j not in no_convocados else "NO" for j in jugadores],
-                "TITULAR": ["SÍ" if j in titulares else "NO" for j in jugadores],
-                "SUPLENTE": ["SÍ" if j in suplentes else "NO" for j in jugadores],
-                "GOL": [0] * len(jugadores),
-                "ASIST": [0] * len(jugadores),
-                "MINUTOS 1a PARTE": [0] * len(jugadores),
-                "MINUTOS 2a PARTE": [0] * len(jugadores),
-            })
-
-            st.markdown("### ✏️ Introducir estadísticas individuales")
-            df_editado = st.data_editor(df_manual, num_rows="fixed", width="stretch")
-
-            submitted = st.form_submit_button("✅ Guardar partido")
-
-        if submitted:
-            if num_titulares != MAX_TITULARES:
-                st.error(f"⚠️ El número de titulares debe ser exactamente {MAX_TITULARES}. Actualmente hay {num_titulares}.")
-            elif len(jugadores_disponibles) < MAX_TITULARES:
-                st.error(f"⚠️ Hay menos de {MAX_TITULARES} jugadores disponibles ({len(jugadores_disponibles)}).")
+            mitad = MINUTOS_PARTIDO / 2
+            invalidos = df_editado[
+                (df_editado["MINUTOS 1a PARTE"] > mitad) | (df_editado["MINUTOS 2a PARTE"] > mitad)
+            ]
+            if not invalidos.empty:
+                st.warning("⚠️ Algunos jugadores superan los minutos máximos por parte.")
+                st.dataframe(invalidos[["JUGADOR", "MINUTOS 1a PARTE", "MINUTOS 2a PARTE"]], width="stretch")
             else:
-                mitad = MINUTOS_PARTIDO / 2
-                invalidos = df_editado[
-                    (df_editado["MINUTOS 1a PARTE"] > mitad) | (df_editado["MINUTOS 2a PARTE"] > mitad)
+                stats = [
+                    {
+                        "player_id":   player_ids[row["JUGADOR"]],
+                        "convocado":   row["CONVOCADO"] == "SÍ",
+                        "titular":     row["TITULAR"] == "SÍ",
+                        "suplente":    row["SUPLENTE"] == "SÍ",
+                        "goles":       int(row["GOL"]),
+                        "asistencias": int(row["ASIST"]),
+                        "minutos_1a":  int(row["MINUTOS 1a PARTE"]),
+                        "minutos_2a":  int(row["MINUTOS 2a PARTE"]),
+                    }
+                    for _, row in df_editado.iterrows()
                 ]
-                if not invalidos.empty:
-                    st.warning("⚠️ Algunos jugadores tienen minutos superiores al máximo permitido por parte.")
-                    st.dataframe(invalidos[["JUGADOR", "MINUTOS 1a PARTE", "MINUTOS 2a PARTE"]], width="stretch")
+                match = db.create_match(
+                    team_id=equipo["id"],
+                    rival=rival.strip(),
+                    match_date=fecha_partido,
+                    is_home=local_visitante,
+                    goals_for=int(goles_a_favor),
+                    goals_against=int(goles_en_contra),
+                    stats=stats,
+                )
+                if match:
+                    st.success(f"✅ {resultado} — Partido guardado correctamente.")
+                    for k in ["no_convocados", "suplentes", "rival", "goles_a_favor", "goles_en_contra", "local_visitante"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
                 else:
-                    df_editado["TOTAL MINUTOS JUGADOS"] = df_editado["MINUTOS 1a PARTE"] + df_editado["MINUTOS 2a PARTE"]
-                    df_editado["% MINUTOS"] = (df_editado["TOTAL MINUTOS JUGADOS"] / MINUTOS_PARTIDO * 100).round(2)
-                    df_editado.loc[0, "LOCAL"] = "Sí" if local_visitante else "No"
-                    nombre_archivo = f"estadisticas_{rival.replace(' ', '_')}_{fecha_str}.csv"
-                    ruta_archivo = CARPETA_PARTIDOS / nombre_archivo
-
-                    if ruta_archivo.exists():
-                        st.warning(f"⚠️ Ya existe '{ruta_archivo.name}'. Se sobrescribirá.")
-
-                    guardar_partido(df_editado, ruta_archivo)
-                    st.success(f"{resultado} ✅ Guardado correctamente")
-                    st.dataframe(df_editado, width="stretch")
+                    st.error("❌ No se pudo guardar el partido. Inténtalo de nuevo.")
 
 
 def page_4():
+    equipo = get_equipo()
     st.header("📜 Histórico de partidos")
 
-    archivos_validos = get_valid_match_files()
-    todos_los_csv = list(CARPETA_PARTIDOS.glob("*.csv"))
-    archivos_invalidos = [
-        f for f in todos_los_csv
-        if f not in archivos_validos and "estadisticas_generadas" not in f.name
-    ]
-
-    if archivos_invalidos:
-        with st.expander("⚠️ Archivos no válidos detectados en la carpeta 'partidos'"):
-            archivo_invalido = st.selectbox(
-                "📂 Selecciona un archivo para revisar:",
-                [f.name for f in archivos_invalidos],
-                index=None,
-            )
-            if archivo_invalido:
-                ruta_invalida = next(f for f in archivos_invalidos if f.name == archivo_invalido)
-                try:
-                    df_preview = pd.read_csv(ruta_invalida)
-                    st.markdown(f"### 👀 Vista previa de **{archivo_invalido}**")
-                    st.dataframe(df_preview, width="stretch")
-                    es_partido = st.toggle("El archivo seleccionado son las estadísticas de un partido", value=False)
-                    if es_partido:
-                        rival_nuevo = st.text_input("🏟️ Nombre del rival:")
-                        fecha_nueva = st.date_input("📅 Fecha del partido:", value=datetime.today())
-                        fecha_str = fecha_nueva.strftime("%Y-%m-%d")
-                        if st.button("💾 Renombrar archivo seleccionado"):
-                            nuevo_nombre = f"estadisticas_{rival_nuevo.replace(' ', '_')}_{fecha_str}.csv"
-                            nueva_ruta = CARPETA_PARTIDOS / nuevo_nombre
-                            if nueva_ruta.exists():
-                                st.warning(f"⚠️ Ya existe '{nuevo_nombre}'. Se sobrescribirá.")
-                            ruta_invalida.rename(nueva_ruta)
-                            st.success(f"✅ Archivo renombrado como '{nuevo_nombre}'.")
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"⚠️ No se pudo leer '{archivo_invalido}': {type(e).__name__} - {e}")
-
-    if not archivos_validos:
-        st.info("📁 No hay partidos guardados todavía.")
+    partidos = db.list_matches(equipo["id"])
+    if not partidos:
+        st.info("📁 No hay partidos registrados todavía.")
         return
 
-    resumen_partidos = []
-    for archivo in archivos_validos:
-        try:
-            df = pd.read_csv(archivo)
-            nombre_limpio = archivo.stem.replace("estadisticas_", "")
-            partes = nombre_limpio.split("_")
-            rival = " ".join(partes[:-1])
-            fecha = partes[-1]
+    resumen = []
+    for p in partidos:
+        gf, gc = p["goals_for"], p["goals_against"]
+        resultado = (
+            "✅ Victoria" if gf > gc else
+            "➖ Empate"   if gf == gc else
+            "❌ Derrota"
+        )
+        marcador = (
+            f"{equipo['name']} {gf} - {gc} {p['rival']}"
+            if p["is_home"]
+            else f"{p['rival']} {gc} - {gf} {equipo['name']}"
+        )
+        resumen.append({"id": p["id"], "Fecha": p["match_date"],
+                        "Rival": p["rival"], "Resultado": resultado, "Marcador": marcador})
 
-            goles_a_favor = df["GOL"][df["GOL"] > 0].sum()
-            goles_en_contra = abs(df["GOL"][df["GOL"] < 0].sum())
-            resultado = (
-                "✅ Victoria" if goles_a_favor > goles_en_contra else
-                "➖ Empate" if goles_a_favor == goles_en_contra else
-                "❌ Derrota"
-            )
-            es_local = False
-            if "LOCAL" in df.columns and pd.notna(df.loc[0, "LOCAL"]):
-                es_local = str(df.loc[0, "LOCAL"]).strip().lower() in ["si", "sí", "true"]
-
-            marcador = (
-                f"{TU_EQUIPO} {int(goles_a_favor)} - {int(goles_en_contra)} {rival}"
-                if es_local
-                else f"{rival} {int(goles_en_contra)} - {int(goles_a_favor)} {TU_EQUIPO}"
-            )
-            resumen_partidos.append({
-                "Archivo": str(archivo),
-                "Fecha": fecha,
-                "Rival": rival,
-                "Resultado": resultado,
-                "Marcador": marcador,
-            })
-        except Exception as e:
-            st.error(f"⚠️ Error al leer {archivo.name}: {e}")
-
-    df_resumen = pd.DataFrame(resumen_partidos)
-    df_resumen["Fecha"] = pd.to_datetime(df_resumen["Fecha"], errors="coerce").dt.date
-    df_resumen = df_resumen.sort_values("Fecha", ascending=False)
-
+    df_resumen = pd.DataFrame(resumen)
     st.subheader("📅 Partidos jugados")
     st.dataframe(df_resumen[["Fecha", "Rival", "Resultado", "Marcador"]], width="stretch")
 
-    partidos_opciones = [f"{row.Fecha} - {row.Rival}" for _, row in df_resumen.iterrows()]
-    partido_seleccionado = st.selectbox("🔍 Selecciona un partido para ver detalles", partidos_opciones, index=None)
+    opciones = [f"{r['Fecha']} - {r['Rival']}" for r in resumen]
+    seleccion = st.selectbox("🔍 Selecciona un partido para ver detalles", opciones, index=None)
+    if not seleccion:
+        return
 
-    if partido_seleccionado:
-        fila = df_resumen.iloc[partidos_opciones.index(partido_seleccionado)]
-        archivo_detalle = Path(fila["Archivo"])
+    partido = resumen[opciones.index(seleccion)]
+    match_data, stats_data = db.get_match(partido["id"])
+    if not match_data:
+        st.error("No se pudo cargar el partido.")
+        return
 
-        st.markdown(f"### 📊 Detalles: **{fila['Rival']}** ({fila['Fecha']})")
-        st.info(f"📍 **Marcador:** {fila['Marcador']}")
+    st.markdown(f"### 📊 Detalles: **{partido['Rival']}** ({partido['Fecha']})")
+    st.info(f"📍 **Marcador:** {partido['Marcador']}")
 
-        # Modo edición
-        editando = st.session_state.get("editando_partido") == str(archivo_detalle)
+    player_ids_map = {}
+    filas = []
+    for s in stats_data:
+        nombre = s["players"]["name"] if s.get("players") else s["player_id"]
+        player_ids_map[nombre] = s["player_id"]
+        filas.append({
+            "JUGADOR":          nombre,
+            "CONVOCADO":        "SÍ" if s["convocado"] else "NO",
+            "TITULAR":          "SÍ" if s["titular"] else "NO",
+            "SUPLENTE":         "SÍ" if s["suplente"] else "NO",
+            "GOL":              s["goles"],
+            "ASIST":            s["asistencias"],
+            "MINUTOS 1a PARTE": s["minutos_1a"],
+            "MINUTOS 2a PARTE": s["minutos_2a"],
+        })
+    df_detalle = pd.DataFrame(filas)
 
-        _, col_editar = st.columns([4, 1])
-        with col_editar:
-            if not editando:
-                if st.button("✏️ Editar partido"):
-                    st.session_state["editando_partido"] = str(archivo_detalle)
-                    st.rerun()
-            else:
-                if st.button("❌ Cancelar edición"):
-                    st.session_state.pop("editando_partido", None)
-                    st.rerun()
-
+    editando = st.session_state.get("editando_partido") == partido["id"]
+    _, col_editar = st.columns([4, 1])
+    with col_editar:
         if not editando:
-            df_detalle = pd.read_csv(archivo_detalle)
-            st.dataframe(df_detalle, width="stretch")
+            if st.button("✏️ Editar partido"):
+                st.session_state["editando_partido"] = partido["id"]
+                st.rerun()
         else:
-            st.warning("Estás editando este partido. Modifica los datos y pulsa Guardar.")
-            df_detalle = pd.read_csv(archivo_detalle)
-            df_editado = st.data_editor(df_detalle, width="stretch", num_rows="fixed")
-            if st.button("💾 Guardar cambios"):
-                guardar_partido(df_editado, archivo_detalle)
-                st.success(f"✅ Partido guardado correctamente.")
+            if st.button("❌ Cancelar edición"):
                 st.session_state.pop("editando_partido", None)
                 st.rerun()
 
+    if not editando:
+        st.dataframe(df_detalle, width="stretch")
+    else:
+        st.warning("Estás editando este partido. Modifica los datos y pulsa Guardar.")
+        df_edit = st.data_editor(df_detalle, width="stretch", num_rows="fixed")
+        if st.button("💾 Guardar cambios"):
+            stats_upd = [
+                {
+                    "player_id":   player_ids_map[row["JUGADOR"]],
+                    "convocado":   row["CONVOCADO"] == "SÍ",
+                    "titular":     row["TITULAR"] == "SÍ",
+                    "suplente":    row["SUPLENTE"] == "SÍ",
+                    "goles":       int(row["GOL"]),
+                    "asistencias": int(row["ASIST"]),
+                    "minutos_1a":  int(row["MINUTOS 1a PARTE"]),
+                    "minutos_2a":  int(row["MINUTOS 2a PARTE"]),
+                }
+                for _, row in df_edit.iterrows()
+            ]
+            ok = db.update_match(
+                match_id=partido["id"],
+                rival=match_data["rival"],
+                match_date=datetime.strptime(match_data["match_date"], "%Y-%m-%d").date(),
+                is_home=match_data["is_home"],
+                goals_for=match_data["goals_for"],
+                goals_against=match_data["goals_against"],
+                stats=stats_upd,
+            )
+            if ok:
+                st.success("✅ Partido guardado correctamente.")
+                st.session_state.pop("editando_partido", None)
+                st.rerun()
+            else:
+                st.error("❌ No se pudo guardar.")
+
 
 def page_plantilla():
+    equipo = get_equipo()
     st.header("👥 Plantilla")
-    st.markdown("Gestiona la lista de jugadores del equipo.")
+    st.markdown(f"Gestiona los jugadores de **{equipo['name']}**.")
 
-    jugadores = load_jugadores()
+    players = db.list_players(equipo["id"])
 
-    # Añadir jugador
     with st.form("form_añadir_jugador", clear_on_submit=True):
         nuevo = st.text_input("Nombre del nuevo jugador")
         if st.form_submit_button("➕ Añadir jugador"):
             nuevo = nuevo.strip()
+            nombres_actuales = [p["name"] for p in players]
             if not nuevo:
                 st.error("❌ El nombre no puede estar vacío.")
-            elif nuevo in jugadores:
+            elif nuevo in nombres_actuales:
                 st.warning(f"⚠️ '{nuevo}' ya está en la plantilla.")
             else:
-                jugadores.append(nuevo)
-                save_jugadores(jugadores)
-                st.success(f"✅ '{nuevo}' añadido a la plantilla.")
-                st.rerun()
+                result = db.add_player(equipo["id"], nuevo)
+                if result:
+                    st.success(f"✅ '{nuevo}' añadido a la plantilla.")
+                    st.rerun()
+                else:
+                    st.error("No se pudo añadir el jugador.")
 
     st.divider()
 
-    if not jugadores:
+    if not players:
         st.info("La plantilla está vacía. Añade jugadores usando el formulario de arriba.")
         return
 
-    st.subheader(f"Jugadores en plantilla ({len(jugadores)})")
+    st.subheader(f"Jugadores en plantilla ({len(players)})")
 
-    # Confirmar eliminación
     eliminar_key = "confirmar_eliminar"
     jugador_a_eliminar = st.session_state.get(eliminar_key)
 
     if jugador_a_eliminar:
-        st.warning(f"¿Seguro que quieres eliminar a **{jugador_a_eliminar}** de la plantilla?")
+        nombre_eli = jugador_a_eliminar["name"]
+        st.warning(f"¿Dar de baja a **{nombre_eli}**? Se conservará su histórico de partidos.")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("✅ Sí, eliminar"):
-                jugadores = [j for j in jugadores if j != jugador_a_eliminar]
-                save_jugadores(jugadores)
+            if st.button("✅ Sí, dar de baja"):
+                db.deactivate_player(jugador_a_eliminar["id"])
                 st.session_state.pop(eliminar_key, None)
-                st.success(f"'{jugador_a_eliminar}' eliminado de la plantilla.")
+                st.success(f"'{nombre_eli}' dado de baja.")
                 st.rerun()
         with c2:
             if st.button("❌ Cancelar"):
                 st.session_state.pop(eliminar_key, None)
                 st.rerun()
 
-    for jugador in jugadores:
+    for jugador in players:
         col_nombre, col_btn = st.columns([5, 1])
-        col_nombre.write(jugador)
-        if col_btn.button("🗑️", key=f"del_{jugador}", help=f"Eliminar {jugador}"):
+        col_nombre.write(jugador["name"])
+        if col_btn.button("🗑️", key=f"del_{jugador['id']}", help=f"Dar de baja a {jugador['name']}"):
             st.session_state[eliminar_key] = jugador
             st.rerun()
 
 
-# ── Navegación ────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+if not db.current_user():
+    mostrar_login()
+    st.stop()
+
+equipo_disponible = sidebar_equipo()
+if not equipo_disponible or "current_team" not in st.session_state:
+    st.stop()
+
+equipo_actual = get_equipo()
+st.header(f"⚽ {equipo_actual['name']} — {equipo_actual['category']}")
 
 pg = st.navigation({
     "Estadísticas equipo": [

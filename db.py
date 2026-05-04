@@ -16,6 +16,8 @@ def get_client() -> Client:
     if tokens:
         try:
             client.auth.set_session(tokens["access_token"], tokens["refresh_token"])
+            # Propagar el token JWT al cliente PostgREST para que RLS funcione
+            client.postgrest.auth(tokens["access_token"])
         except Exception:
             st.session_state.pop("_sb_tokens", None)
             st.session_state.pop("_sb_user", None)
@@ -81,6 +83,7 @@ def create_team(name: str, category: str, max_titulares: int = 8, minutos_partid
     """Crea un equipo nuevo para el usuario actual."""
     user = current_user()
     if not user:
+        st.error("Error al crear equipo: no hay usuario autenticado en sesión.")
         return None
     try:
         res = get_client().table("teams").insert({
@@ -91,7 +94,8 @@ def create_team(name: str, category: str, max_titulares: int = 8, minutos_partid
             "minutos_partido": minutos_partido,
         }).execute()
         return res.data[0] if res.data else None
-    except Exception:
+    except Exception as e:
+        st.error(f"Error al crear equipo: {e}")
         return None
 
 
