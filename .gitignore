@@ -1,0 +1,26 @@
+# Datos locales (se migrarán a Supabase en próximas fases)
+partidos/
+estadisticas_generadas.csv
+jugadores.json
+*.db
+
+# Secretos y entorno
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Editores / IDE
+.vscode/
+.idea/
+*.swp
+
+# SO
+.DS_Store
+Thumbs.db
