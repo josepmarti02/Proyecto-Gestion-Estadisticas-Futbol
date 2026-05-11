@@ -128,3 +128,13 @@ AS $$
   GROUP BY p.id, p.name
   ORDER BY p.name;
 $$;
+
+-- ── Permisos para el rol authenticated ───────────────────────────────────────
+-- RLS controla qué filas ve cada usuario; GRANT controla si el rol puede
+-- acceder a la tabla en absoluto. Ambos son necesarios.
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.teams       TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.players     TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.matches     TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.match_stats TO authenticated;
+GRANT EXECUTE ON FUNCTION get_team_aggregates(UUID)        TO authenticated;
