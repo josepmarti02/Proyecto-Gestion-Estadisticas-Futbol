@@ -52,6 +52,38 @@ def metricas_extra(df: pd.DataFrame, total_partidos: int) -> pd.DataFrame:
     return data
 
 
+def calcular_racha(partidos: list) -> tuple[str, int]:
+    """Racha consecutiva del resultado más reciente (partidos ordenados desc por fecha)."""
+    if not partidos:
+        return "", 0
+    racha_tipo = None
+    racha_count = 0
+    for p in partidos:
+        gf, gc = p["goals_for"], p["goals_against"]
+        tipo = "Victoria" if gf > gc else ("Empate" if gf == gc else "Derrota")
+        if racha_tipo is None:
+            racha_tipo, racha_count = tipo, 1
+        elif tipo == racha_tipo:
+            racha_count += 1
+        else:
+            break
+    return racha_tipo, racha_count
+
+
+def mejor_resultado(partidos: list) -> dict | None:
+    """Partido con mayor diferencia de goles a favor."""
+    if not partidos:
+        return None
+    return max(partidos, key=lambda p: p["goals_for"] - p["goals_against"])
+
+
+def partido_mas_goles(partidos: list) -> dict | None:
+    """Partido con más goles totales entre ambos equipos."""
+    if not partidos:
+        return None
+    return max(partidos, key=lambda p: p["goals_for"] + p["goals_against"])
+
+
 # ── Configuración de la app ───────────────────────────────────────────────────
 
 st.set_page_config(
@@ -177,6 +209,8 @@ def page_1():
     st.subheader(f"📊 Estadísticas de {equipo['name']}")
 
     df, totales = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
+    partidos_raw = db.list_matches(equipo["id"])
+
     if df.empty:
         st.info("📁 Aún no hay partidos registrados. Ve a **Añadir partido** para empezar.")
         return
@@ -188,6 +222,24 @@ def page_1():
     c3.metric("Goles en contra", totales["total_goles_contra"])
     c4.metric("Asistencias", totales["total_asist"])
 
+    # C2: Racha y récords
+    if partidos_raw:
+        st.subheader("🏆 Récords de la temporada")
+        tipo_racha, n_racha = calcular_racha(partidos_raw)
+        p_mejor = mejor_resultado(partidos_raw)
+        p_goles = partido_mas_goles(partidos_raw)
+
+        def fmt_marcador(p: dict) -> str:
+            gf, gc = p["goals_for"], p["goals_against"]
+            return (f"{equipo['name']} {gf}-{gc} {p['rival']}"
+                    if p["is_home"] else f"{p['rival']} {gc}-{gf} {equipo['name']}")
+
+        icono_racha = {"Victoria": "✅", "Empate": "➖", "Derrota": "❌"}.get(tipo_racha, "")
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.metric("Racha actual", f"{icono_racha} {n_racha} {tipo_racha.lower()}")
+        rc2.metric("Mejor resultado", fmt_marcador(p_mejor), p_mejor["match_date"])
+        rc3.metric("Partido más goleador", fmt_marcador(p_goles), p_goles["match_date"])
+
     with st.expander("📋 Resumen del equipo", expanded=False):
         resumen = estadisticas_generales(totales)
         df_resumen = pd.DataFrame({"Estadística": resumen.keys(), "Total": resumen.values()})
@@ -195,6 +247,11 @@ def page_1():
 
     st.subheader("📈 Estadísticas acumuladas por jugador")
     st.dataframe(df, width="stretch")
+
+    # A6: Gráfico de % de minutos por jugador
+    st.subheader("⏱️ % de minutos jugados por jugador")
+    df_min_chart = df.set_index("JUGADOR")[["% MINUTOS"]].sort_values("% MINUTOS")
+    st.bar_chart(df_min_chart)
 
 
 def page_2():
@@ -228,6 +285,16 @@ def page_2():
                     col.dataframe(ranking(df_extra, metrica), width="stretch")
     else:
         st.warning("Selecciona al menos un ranking para mostrar resultados.")
+
+    # A6: Distribución de goles del equipo
+    if totales["total_goles"] > 0:
+        st.subheader("⚽ Distribución de goles del equipo")
+        df_goles_chart = (
+            df[df["GOL"] > 0][["JUGADOR", "GOL"]]
+            .set_index("JUGADOR")
+            .sort_values("GOL", ascending=False)
+        )
+        st.bar_chart(df_goles_chart)
 
 
 def page_3():
@@ -399,6 +466,19 @@ def page_4():
     st.subheader("📅 Partidos jugados")
     st.dataframe(df_resumen[["Fecha", "Rival", "Resultado", "Marcador"]], width="stretch")
 
+    # A6: Evolución de goles por jornada
+    if len(partidos) > 1:
+        st.subheader("📈 Evolución de goles")
+        df_evol = pd.DataFrame([
+            {
+                "Partido": f"{p['match_date']} vs {p['rival']}",
+                "Goles a favor": p["goals_for"],
+                "Goles en contra": p["goals_against"],
+            }
+            for p in reversed(partidos)
+        ]).set_index("Partido")
+        st.line_chart(df_evol)
+
     opciones = [f"{r['Fecha']} - {r['Rival']}" for r in resumen]
     seleccion = st.selectbox("🔍 Selecciona un partido para ver detalles", opciones, index=None)
     if not seleccion:
@@ -469,7 +549,47 @@ def page_4():
             st.rerun()
 
     if not editando:
-        st.dataframe(df_detalle, width="stretch")
+        # C1: Ficha visual del partido
+        goleadores = df_detalle[df_detalle["GOL"] > 0][["JUGADOR", "GOL"]].sort_values("GOL", ascending=False)
+        asistentes = df_detalle[df_detalle["ASIST"] > 0][["JUGADOR", "ASIST"]].sort_values("ASIST", ascending=False)
+
+        col_gol, col_asist = st.columns(2)
+        with col_gol:
+            st.markdown("**⚽ Goleadores**")
+            if goleadores.empty:
+                st.caption("Sin goles propios en este partido.")
+            else:
+                for _, row in goleadores.iterrows():
+                    st.write(f"{'⚽' * int(row['GOL'])} {row['JUGADOR']}")
+        with col_asist:
+            st.markdown("**🎯 Asistencias**")
+            if asistentes.empty:
+                st.caption("Sin asistencias registradas.")
+            else:
+                for _, row in asistentes.iterrows():
+                    st.write(f"{'🎯' * int(row['ASIST'])} {row['JUGADOR']}")
+
+        st.markdown("**⏱️ Minutos jugados**")
+        df_min = df_detalle[df_detalle["CONVOCADO"] == "SÍ"][
+            ["JUGADOR", "MINUTOS 1a PARTE", "MINUTOS 2a PARTE"]
+        ].copy()
+        df_min["TOTAL"] = df_min["MINUTOS 1a PARTE"] + df_min["MINUTOS 2a PARTE"]
+        st.dataframe(
+            df_min,
+            column_config={
+                "TOTAL": st.column_config.ProgressColumn(
+                    "Total minutos",
+                    min_value=0,
+                    max_value=equipo["minutos_partido"],
+                    format="%d min",
+                )
+            },
+            hide_index=True,
+            width="stretch",
+        )
+
+        with st.expander("📋 Tabla completa de estadísticas"):
+            st.dataframe(df_detalle, width="stretch")
     else:
         st.warning("Estás editando este partido. Modifica los datos y pulsa Guardar.")
         df_edit = st.data_editor(df_detalle, width="stretch", num_rows="fixed")
