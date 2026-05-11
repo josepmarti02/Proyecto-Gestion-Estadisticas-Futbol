@@ -139,6 +139,15 @@ def deactivate_player(player_id: str) -> bool:
         return False
 
 
+def activate_player(player_id: str) -> bool:
+    """Reactiva un jugador dado de baja."""
+    try:
+        get_client().table("players").update({"active": True}).eq("id", player_id).execute()
+        return True
+    except Exception:
+        return False
+
+
 def rename_player(player_id: str, new_name: str) -> bool:
     """Renombra un jugador."""
     try:
@@ -256,37 +265,50 @@ def delete_match(match_id: str) -> bool:
 
 # ── Acumulado ─────────────────────────────────────────────────────────────────
 
-def get_team_aggregates(team_id: str, minutos_partido: int) -> pd.DataFrame:
+def get_team_aggregates(team_id: str, minutos_partido: int) -> tuple[pd.DataFrame, dict]:
     """
-    Devuelve el DataFrame de estadísticas acumuladas por jugador.
-    Usa la función SQL get_team_aggregates() y calcula los porcentajes en Python.
-    Las columnas son compatibles con las funciones puras del código original
-    (estadisticas_generales, ranking, metricas_extra).
+    Devuelve (df_jugadores, totales_equipo).
+    df_jugadores: estadísticas por jugador sin columnas globales (sin nulls).
+    totales_equipo: dict con total_partidos, total_goles, total_asist,
+                    total_minutos, total_goles_contra.
     """
+    _vacio = {"total_partidos": 0, "total_goles": 0, "total_asist": 0,
+              "total_minutos": 0, "total_goles_contra": 0}
     try:
+        partidos = list_matches(team_id)
+        total_partidos = len(partidos)
+        total_goles_contra = sum(m["goals_against"] for m in partidos)
+
         res = get_client().rpc("get_team_aggregates", {"p_team_id": team_id}).execute()
         if not res.data:
-            return pd.DataFrame()
+            return pd.DataFrame(), {**_vacio, "total_partidos": total_partidos,
+                                    "total_goles_contra": total_goles_contra}
 
         df = pd.DataFrame(res.data)
-        total_partidos = len(list_matches(team_id))
-        total_goles = int(df["gol"].clip(lower=0).sum())
-        total_asist = int(df["asist"].sum())
+        total_goles   = int(df["gol"].clip(lower=0).sum())
+        total_asist   = int(df["asist"].sum())
         total_minutos = int(df["total_min"].sum())
 
-        # Porcentajes
-        df["% CONVOCADO"] = (df["convocado"] / total_partidos * 100).round(1) if total_partidos else 0.0
-        df["% TITULAR"] = (df["titular"] / df["convocado"].replace(0, pd.NA) * 100).fillna(0).round(1)
-        df["% SUPLENTE"] = (df["suplente"] / df["convocado"].replace(0, pd.NA) * 100).fillna(0).round(1)
-        df["% GOLES"] = (df["gol"] / total_goles * 100).round(1) if total_goles else 0.0
-        df["% ASIST"] = (df["asist"] / total_asist * 100).round(1) if total_asist else 0.0
-        posibles = df["convocado"] * minutos_partido
-        df["POSIBLES MINUTOS"] = posibles
-        df["% MINUTOS"] = (df["total_min"] / posibles.replace(0, pd.NA) * 100).fillna(0).round(1)
-        df["PRODUCTIVIDAD OFENSIVA"] = df["gol"] + df["asist"]
-        df["EFICIENCIA GOLEADORA"] = (df["gol"] / df["convocado"].replace(0, pd.NA)).fillna(0).round(2)
+        totales = {
+            "total_partidos":    total_partidos,
+            "total_goles":       total_goles,
+            "total_asist":       total_asist,
+            "total_minutos":     total_minutos,
+            "total_goles_contra": total_goles_contra,
+        }
 
-        # Renombrar a los nombres que espera el resto de la app
+        # Porcentajes por jugador
+        df["% CONVOCADO"] = (df["convocado"] / total_partidos * 100).round(1) if total_partidos else 0.0
+        df["% TITULAR"]   = (df["titular"]  / df["convocado"].replace(0, pd.NA) * 100).fillna(0).round(1)
+        df["% SUPLENTE"]  = (df["suplente"] / df["convocado"].replace(0, pd.NA) * 100).fillna(0).round(1)
+        df["% GOLES"]     = (df["gol"]   / total_goles * 100).round(1) if total_goles else 0.0
+        df["% ASIST"]     = (df["asist"] / total_asist * 100).round(1) if total_asist else 0.0
+        posibles = df["convocado"] * minutos_partido
+        df["POSIBLES MINUTOS"]      = posibles
+        df["% MINUTOS"]             = (df["total_min"] / posibles.replace(0, pd.NA) * 100).fillna(0).round(1)
+        df["PRODUCTIVIDAD OFENSIVA"] = df["gol"] + df["asist"]
+        df["EFICIENCIA GOLEADORA"]   = (df["gol"] / total_partidos).round(2) if total_partidos else 0.0
+
         df = df.rename(columns={
             "jugador":    "JUGADOR",
             "convocado":  "CONVOCADO",
@@ -299,27 +321,16 @@ def get_team_aggregates(team_id: str, minutos_partido: int) -> pd.DataFrame:
             "total_min":  "TOTAL MINUTOS JUGADOS",
         })
 
-        # Columnas globales del equipo en la primera fila (igual que el código original)
-        df.insert(0, "PARTIDOS", pd.NA)
-        df.insert(1, "TOTAL GOLES", pd.NA)
-        df.insert(2, "TOTAL ASIST", pd.NA)
-        df.insert(3, "MINUTOS TOTALES", pd.NA)
-        if not df.empty:
-            df.loc[df.index[0], "PARTIDOS"] = total_partidos
-            df.loc[df.index[0], "TOTAL GOLES"] = total_goles
-            df.loc[df.index[0], "TOTAL ASIST"] = total_asist
-            df.loc[df.index[0], "MINUTOS TOTALES"] = total_minutos
-
         columnas = [
-            "JUGADOR", "PARTIDOS", "TOTAL GOLES", "TOTAL ASIST", "MINUTOS TOTALES",
+            "JUGADOR",
             "CONVOCADO", "% CONVOCADO", "TITULAR", "% TITULAR", "SUPLENTE", "% SUPLENTE",
             "GOL", "% GOLES", "ASIST", "% ASIST",
             "MINUTOS 1a PARTE", "MINUTOS 2a PARTE", "TOTAL MINUTOS JUGADOS",
             "POSIBLES MINUTOS", "% MINUTOS",
             "PRODUCTIVIDAD OFENSIVA", "EFICIENCIA GOLEADORA",
         ]
-        return df[[c for c in columnas if c in df.columns]]
+        return df[[c for c in columnas if c in df.columns]], totales
 
     except Exception as e:
         st.error(f"Error al obtener acumulado: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), _vacio

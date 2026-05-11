@@ -15,31 +15,23 @@ opciones_ranking = ["GOL", "ASIST", "TOTAL MINUTOS JUGADOS",
 
 # ── Funciones puras de estadísticas ──────────────────────────────────────────
 
-def estadisticas_generales(df) -> dict:
-    if df.empty:
-        return {"Partidos": 0, "Goles a favor": 0, "Asistencias": 0,
-                "Goles en contra": 0, "Diferencia de goles": 0}
-    data = df.copy()
-    for col in ["GOL", "ASIST", "PARTIDOS"]:
-        if col not in data.columns:
-            data[col] = 0
-    data["GOL"] = pd.to_numeric(data["GOL"], errors="coerce").fillna(0)
-    data["ASIST"] = pd.to_numeric(data["ASIST"], errors="coerce").fillna(0)
-    total_goles = int(data[data["GOL"] >= 0]["GOL"].sum())
-    total_goles_contra = abs(int(data[data["GOL"] < 0]["GOL"].sum()))
-    total_asist = int(data[data["GOL"] >= 0]["ASIST"].sum())
-    total_partidos = int(pd.to_numeric(data["PARTIDOS"].iloc[0], errors="coerce") or 0)
+def estadisticas_generales(totales: dict) -> dict:
+    """Devuelve el resumen del equipo usando el dict de totales ya calculado."""
+    total_partidos   = totales.get("total_partidos", 0)
+    total_goles      = totales.get("total_goles", 0)
+    total_asist      = totales.get("total_asist", 0)
+    total_goles_contra = totales.get("total_goles_contra", 0)
     diferencia = total_goles - total_goles_contra
-    media_favor = round(total_goles / total_partidos, 2) if total_partidos else 0
+    media_favor  = round(total_goles / total_partidos, 2) if total_partidos else 0
     media_contra = round(total_goles_contra / total_partidos, 2) if total_partidos else 0
     return {
-        "Partidos": total_partidos,
-        "Goles a favor": total_goles,
-        "Media goles a favor": media_favor,
-        "Asistencias": total_asist,
-        "Goles en contra": total_goles_contra,
+        "Partidos":              total_partidos,
+        "Goles a favor":         total_goles,
+        "Media goles a favor":   media_favor,
+        "Asistencias":           total_asist,
+        "Goles en contra":       total_goles_contra,
         "Media goles en contra": media_contra,
-        "Diferencia de goles": diferencia,
+        "Diferencia de goles":   diferencia,
     }
 
 
@@ -51,13 +43,12 @@ def ranking(df, columna, top=3):
     return df_r
 
 
-def metricas_extra(df):
+def metricas_extra(df: pd.DataFrame, total_partidos: int) -> pd.DataFrame:
     data = df.copy()
     if "GOL" in data.columns and "ASIST" in data.columns:
         data["PRODUCTIVIDAD OFENSIVA"] = data["GOL"] + data["ASIST"]
-    if "GOL" in data.columns and "PARTIDOS" in data.columns:
-        partidos = pd.to_numeric(data["PARTIDOS"].iloc[0], errors="coerce") or 1
-        data["EFICIENCIA GOLEADORA"] = (data["GOL"] / partidos).round(2)
+    if "GOL" in data.columns and total_partidos:
+        data["EFICIENCIA GOLEADORA"] = (data["GOL"] / total_partidos).round(2)
     return data
 
 
@@ -185,17 +176,24 @@ def page_1():
     equipo = get_equipo()
     st.subheader(f"📊 Estadísticas de {equipo['name']}")
 
-    df = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
+    df, totales = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
     if df.empty:
         st.info("📁 Aún no hay partidos registrados. Ve a **Añadir partido** para empezar.")
         return
 
-    with st.expander("📋 Resumen del equipo", expanded=True):
-        resumen = estadisticas_generales(df)
+    # Tarjetas de totales del equipo (A1)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Partidos", totales["total_partidos"])
+    c2.metric("Goles a favor", totales["total_goles"])
+    c3.metric("Goles en contra", totales["total_goles_contra"])
+    c4.metric("Asistencias", totales["total_asist"])
+
+    with st.expander("📋 Resumen del equipo", expanded=False):
+        resumen = estadisticas_generales(totales)
         df_resumen = pd.DataFrame({"Estadística": resumen.keys(), "Total": resumen.values()})
         st.dataframe(df_resumen, width="stretch")
 
-    st.subheader("📈 Estadísticas acumuladas")
+    st.subheader("📈 Estadísticas acumuladas por jugador")
     st.dataframe(df, width="stretch")
 
 
@@ -203,7 +201,7 @@ def page_2():
     equipo = get_equipo()
     st.header("🪄 Estadísticas individuales")
 
-    df = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
+    df, totales = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
     if df.empty:
         st.info("📁 Aún no hay partidos registrados.")
         return
@@ -217,7 +215,7 @@ def page_2():
     else:
         st.warning("Selecciona al menos un jugador.")
 
-    df_extra = metricas_extra(df)
+    df_extra = metricas_extra(df, totales["total_partidos"])
     seleccion_rankings = st.multiselect("🏆 Mostrar rankings", options=opciones_ranking)
     if seleccion_rankings:
         num_cols = min(len(seleccion_rankings), 3)
@@ -433,16 +431,42 @@ def page_4():
     df_detalle = pd.DataFrame(filas)
 
     editando = st.session_state.get("editando_partido") == partido["id"]
-    _, col_editar = st.columns([4, 1])
+    confirmando_borrar = st.session_state.get("confirmar_eliminar_partido") == partido["id"]
+
+    # Botones de acción (A2: añadido Eliminar)
+    _, col_editar, col_borrar = st.columns([3, 1, 1])
     with col_editar:
         if not editando:
-            if st.button("✏️ Editar partido"):
+            if st.button("✏️ Editar partido", use_container_width=True):
                 st.session_state["editando_partido"] = partido["id"]
+                st.session_state.pop("confirmar_eliminar_partido", None)
                 st.rerun()
         else:
-            if st.button("❌ Cancelar edición"):
+            if st.button("❌ Cancelar edición", use_container_width=True):
                 st.session_state.pop("editando_partido", None)
                 st.rerun()
+
+    with col_borrar:
+        if not confirmando_borrar:
+            if st.button("🗑️ Eliminar", use_container_width=True):
+                st.session_state["confirmar_eliminar_partido"] = partido["id"]
+                st.session_state.pop("editando_partido", None)
+                st.rerun()
+        else:
+            if st.button("⚠️ Confirmar borrado", use_container_width=True, type="primary"):
+                if db.delete_match(partido["id"]):
+                    st.session_state.pop("confirmar_eliminar_partido", None)
+                    st.success("Partido eliminado.")
+                    st.rerun()
+                else:
+                    st.error("No se pudo eliminar el partido.")
+
+    # Aviso de confirmación
+    if confirmando_borrar:
+        st.warning(f"¿Seguro que quieres eliminar el partido contra **{partido['Rival']}** del {partido['Fecha']}? Esta acción no se puede deshacer.")
+        if st.button("↩️ Cancelar"):
+            st.session_state.pop("confirmar_eliminar_partido", None)
+            st.rerun()
 
     if not editando:
         st.dataframe(df_detalle, width="stretch")
@@ -508,34 +532,110 @@ def page_plantilla():
 
     if not players:
         st.info("La plantilla está vacía. Añade jugadores usando el formulario de arriba.")
-        return
+    else:
+        st.subheader(f"Jugadores en plantilla ({len(players)})")
 
-    st.subheader(f"Jugadores en plantilla ({len(players)})")
+        eliminar_key = "confirmar_eliminar"
+        jugador_a_eliminar = st.session_state.get(eliminar_key)
 
-    eliminar_key = "confirmar_eliminar"
-    jugador_a_eliminar = st.session_state.get(eliminar_key)
+        if jugador_a_eliminar:
+            nombre_eli = jugador_a_eliminar["name"]
+            st.warning(f"¿Dar de baja a **{nombre_eli}**? Se conservará su histórico de partidos.")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ Sí, dar de baja"):
+                    db.deactivate_player(jugador_a_eliminar["id"])
+                    st.session_state.pop(eliminar_key, None)
+                    st.success(f"'{nombre_eli}' dado de baja.")
+                    st.rerun()
+            with c2:
+                if st.button("❌ Cancelar"):
+                    st.session_state.pop(eliminar_key, None)
+                    st.rerun()
 
-    if jugador_a_eliminar:
-        nombre_eli = jugador_a_eliminar["name"]
-        st.warning(f"¿Dar de baja a **{nombre_eli}**? Se conservará su histórico de partidos.")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("✅ Sí, dar de baja"):
-                db.deactivate_player(jugador_a_eliminar["id"])
-                st.session_state.pop(eliminar_key, None)
-                st.success(f"'{nombre_eli}' dado de baja.")
+        for jugador in players:
+            col_nombre, col_btn = st.columns([5, 1])
+            col_nombre.write(jugador["name"])
+            if col_btn.button("🗑️", key=f"del_{jugador['id']}", help=f"Dar de baja a {jugador['name']}"):
+                st.session_state[eliminar_key] = jugador
                 st.rerun()
-        with c2:
-            if st.button("❌ Cancelar"):
-                st.session_state.pop(eliminar_key, None)
-                st.rerun()
 
-    for jugador in players:
-        col_nombre, col_btn = st.columns([5, 1])
-        col_nombre.write(jugador["name"])
-        if col_btn.button("🗑️", key=f"del_{jugador['id']}", help=f"Dar de baja a {jugador['name']}"):
-            st.session_state[eliminar_key] = jugador
-            st.rerun()
+    # Jugadores dados de baja (A3)
+    st.divider()
+    bajas = [p for p in db.list_players(equipo["id"], only_active=False) if not p["active"]]
+    if bajas:
+        with st.expander(f"👤 Jugadores dados de baja ({len(bajas)})"):
+            reactivar_key = "confirmar_reactivar"
+            jugador_a_reactivar = st.session_state.get(reactivar_key)
+
+            if jugador_a_reactivar:
+                nombre_reac = jugador_a_reactivar["name"]
+                st.info(f"¿Reactivar a **{nombre_reac}**? Volverá a aparecer en la plantilla.")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("✅ Sí, reactivar"):
+                        db.activate_player(jugador_a_reactivar["id"])
+                        st.session_state.pop(reactivar_key, None)
+                        st.success(f"'{nombre_reac}' reactivado.")
+                        st.rerun()
+                with c2:
+                    if st.button("❌ Cancelar", key="cancel_reactivar"):
+                        st.session_state.pop(reactivar_key, None)
+                        st.rerun()
+
+            for jugador in bajas:
+                col_nombre, col_btn = st.columns([5, 1])
+                col_nombre.write(jugador["name"])
+                if col_btn.button("↩️", key=f"react_{jugador['id']}", help=f"Reactivar a {jugador['name']}"):
+                    st.session_state[reactivar_key] = jugador
+                    st.rerun()
+
+
+def page_config():
+    """A4: Configuración del equipo."""
+    equipo = get_equipo()
+    st.header("⚙️ Configuración del equipo")
+
+    with st.form("form_config_equipo"):
+        nombre = st.text_input("Nombre del equipo", value=equipo.get("name", ""))
+        categoria = st.text_input("Categoría", value=equipo.get("category", ""))
+        max_titulares = st.number_input(
+            "Titulares por partido",
+            min_value=5, max_value=11,
+            value=equipo.get("max_titulares", 8),
+        )
+        minutos_partido = st.number_input(
+            "Minutos por partido",
+            min_value=20, max_value=90,
+            value=equipo.get("minutos_partido", 50),
+        )
+        guardado = st.form_submit_button("💾 Guardar cambios")
+
+    if guardado:
+        nombre = nombre.strip()
+        if not nombre:
+            st.error("❌ El nombre no puede estar vacío.")
+        else:
+            ok = db.update_team(
+                equipo["id"],
+                name=nombre,
+                category=categoria.strip(),
+                max_titulares=int(max_titulares),
+                minutos_partido=int(minutos_partido),
+            )
+            if ok:
+                # Actualizar session_state para que el resto de páginas lo vean ya
+                st.session_state["current_team"] = {
+                    **equipo,
+                    "name": nombre,
+                    "category": categoria.strip(),
+                    "max_titulares": int(max_titulares),
+                    "minutos_partido": int(minutos_partido),
+                }
+                st.success("✅ Configuración guardada.")
+                st.rerun()
+            else:
+                st.error("❌ No se pudo guardar la configuración.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -562,6 +662,7 @@ pg = st.navigation({
     ],
     "Equipo": [
         st.Page(page_plantilla, title="Plantilla", icon="👥"),
+        st.Page(page_config, title="Configuración", icon="⚙️"),
     ],
 })
 pg.run()
