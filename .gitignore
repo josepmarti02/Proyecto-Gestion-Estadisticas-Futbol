@@ -1,3 +1,6 @@
+# Documentos locales (no públicos)
+planing_despliegue_app.md
+
 # Datos locales (se migrarán a Supabase en próximas fases)
 partidos/
 estadisticas_generadas.csv
