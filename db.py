@@ -138,21 +138,29 @@ def list_players(team_id: str, only_active: bool = True) -> list[dict]:
         return []
 
 
-def add_player(team_id: str, name: str, position: str = "") -> Optional[dict]:
-    """Añade un jugador a la plantilla."""
+def add_player(team_id: str, name: str, position: str = "",
+               alt_positions: Optional[list[str]] = None) -> Optional[dict]:
+    """Añade un jugador a la plantilla con posición primaria y alternativas."""
     try:
-        res = get_client().table("players").insert(
-            {"team_id": team_id, "name": name, "position": position}
-        ).execute()
+        res = get_client().table("players").insert({
+            "team_id": team_id,
+            "name": name,
+            "position": position,
+            "alt_positions": alt_positions or [],
+        }).execute()
         return res.data[0] if res.data else None
     except Exception:
         return None
 
 
-def update_player_position(player_id: str, position: str) -> bool:
-    """Actualiza la posición de un jugador."""
+def update_player_positions(player_id: str, position: str,
+                            alt_positions: Optional[list[str]] = None) -> bool:
+    """Actualiza la posición primaria y las alternativas de un jugador."""
     try:
-        get_client().table("players").update({"position": position}).eq("id", player_id).execute()
+        get_client().table("players").update({
+            "position": position,
+            "alt_positions": alt_positions or [],
+        }).eq("id", player_id).execute()
         return True
     except Exception:
         return False
@@ -228,6 +236,7 @@ def create_match(
     goals_against: int,
     stats: list[dict],
     notes: str = "",
+    mvp_player_id: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Crea un partido completo con sus estadísticas de jugadores.
@@ -244,6 +253,7 @@ def create_match(
             "goals_for": goals_for,
             "goals_against": goals_against,
             "notes": notes,
+            "mvp_player_id": mvp_player_id,
         }).execute()
         if not match_res.data:
             return None
@@ -265,6 +275,7 @@ def update_match(
     goals_against: int,
     stats: list[dict],
     notes: str = "",
+    mvp_player_id: Optional[str] = None,
 ) -> bool:
     """Actualiza la cabecera y reemplaza las estadísticas de un partido."""
     try:
@@ -276,6 +287,7 @@ def update_match(
             "goals_for": goals_for,
             "goals_against": goals_against,
             "notes": notes,
+            "mvp_player_id": mvp_player_id,
         }).eq("id", match_id).execute()
         client.table("match_stats").delete().eq("match_id", match_id).execute()
         client.table("match_stats").insert(
@@ -297,74 +309,140 @@ def delete_match(match_id: str) -> bool:
 
 # ── Acumulado ─────────────────────────────────────────────────────────────────
 
-def get_team_aggregates(team_id: str, minutos_partido: int) -> tuple[pd.DataFrame, dict]:
+_COLUMNAS_ACUMULADO = [
+    "JUGADOR",
+    "CONVOCADO", "% CONVOCADO", "TITULAR", "% TITULAR", "SUPLENTE", "% SUPLENTE",
+    "GOL", "% GOLES", "ASIST", "% ASIST",
+    "AMARILLAS", "ROJAS",
+    "MINUTOS 1a PARTE", "MINUTOS 2a PARTE", "TOTAL MINUTOS JUGADOS",
+    "POSIBLES MINUTOS", "% MINUTOS",
+    "PRODUCTIVIDAD OFENSIVA", "EFICIENCIA GOLEADORA",
+]
+
+
+def _post_process_aggregates(df: pd.DataFrame, total_partidos: int,
+                             minutos_partido: int) -> tuple[pd.DataFrame, dict]:
+    """Recibe un df con columnas crudas (jugador, convocado, titular, ...) y aplica
+    los porcentajes y renames. Devuelve (df_renombrado, totales_dict)."""
+    total_goles   = int(df["gol"].clip(lower=0).sum())
+    total_asist   = int(df["asist"].sum())
+    total_minutos = int(df["total_min"].sum())
+
+    totales = {
+        "total_partidos":   total_partidos,
+        "total_goles":      total_goles,
+        "total_asist":      total_asist,
+        "total_minutos":    total_minutos,
+    }
+
+    df["% CONVOCADO"] = (df["convocado"] / total_partidos * 100).round(1) if total_partidos else 0.0
+    df["% TITULAR"]   = (df["titular"]  / df["convocado"].replace(0, pd.NA) * 100).fillna(0).round(1)
+    df["% SUPLENTE"]  = (df["suplente"] / df["convocado"].replace(0, pd.NA) * 100).fillna(0).round(1)
+    df["% GOLES"]     = (df["gol"]   / total_goles * 100).round(1) if total_goles else 0.0
+    df["% ASIST"]     = (df["asist"] / total_asist * 100).round(1) if total_asist else 0.0
+    posibles = df["convocado"] * minutos_partido
+    df["POSIBLES MINUTOS"]      = posibles
+    df["% MINUTOS"]             = (df["total_min"] / posibles.replace(0, pd.NA) * 100).fillna(0).round(1)
+    df["PRODUCTIVIDAD OFENSIVA"] = df["gol"] + df["asist"]
+    df["EFICIENCIA GOLEADORA"]   = (df["gol"] / total_partidos).round(2) if total_partidos else 0.0
+
+    df = df.rename(columns={
+        "jugador":    "JUGADOR",
+        "convocado":  "CONVOCADO",
+        "titular":    "TITULAR",
+        "suplente":   "SUPLENTE",
+        "gol":        "GOL",
+        "asist":      "ASIST",
+        "minutos_1a": "MINUTOS 1a PARTE",
+        "minutos_2a": "MINUTOS 2a PARTE",
+        "total_min":  "TOTAL MINUTOS JUGADOS",
+        "amarillas":  "AMARILLAS",
+        "rojas":      "ROJAS",
+    })
+    return df[[c for c in _COLUMNAS_ACUMULADO if c in df.columns]], totales
+
+
+def _aggregate_from_matches(team_id: str, partidos: list[dict]) -> Optional[pd.DataFrame]:
+    """Agrega match_stats en Python para un subconjunto de partidos. Devuelve
+    DataFrame con las columnas crudas (jugador, convocado, titular, ...).
+    Incluye TODOS los jugadores activos del equipo aunque no hayan jugado."""
+    client = get_client()
+    players_res = (client.table("players").select("id, name")
+                   .eq("team_id", team_id).eq("active", True)
+                   .order("name").execute())
+    jugadores = players_res.data or []
+    if not jugadores:
+        return pd.DataFrame()
+
+    base = {p["id"]: {
+        "player_id": p["id"], "jugador": p["name"],
+        "convocado": 0, "titular": 0, "suplente": 0,
+        "gol": 0, "asist": 0,
+        "minutos_1a": 0, "minutos_2a": 0, "total_min": 0,
+        "amarillas": 0, "rojas": 0,
+    } for p in jugadores}
+
+    if partidos:
+        match_ids = [p["id"] for p in partidos]
+        stats_res = (client.table("match_stats")
+                     .select("player_id, convocado, titular, suplente, goles, asistencias, "
+                             "minutos_1a, minutos_2a, amarillas, rojas")
+                     .in_("match_id", match_ids).execute())
+        for s in (stats_res.data or []):
+            row = base.get(s["player_id"])
+            if not row:
+                continue
+            row["convocado"]  += 1 if s["convocado"] else 0
+            row["titular"]    += 1 if s["titular"]   else 0
+            row["suplente"]   += 1 if s["suplente"]  else 0
+            row["gol"]        += max(s["goles"] or 0, 0)
+            row["asist"]      += s["asistencias"] or 0
+            row["minutos_1a"] += s["minutos_1a"] or 0
+            row["minutos_2a"] += s["minutos_2a"] or 0
+            row["total_min"]  += (s["minutos_1a"] or 0) + (s["minutos_2a"] or 0)
+            row["amarillas"]  += s.get("amarillas") or 0
+            row["rojas"]      += s.get("rojas") or 0
+
+    return pd.DataFrame(list(base.values()))
+
+
+def get_team_aggregates(team_id: str, minutos_partido: int,
+                        last_n_matches: Optional[int] = None,
+                        since_date: Optional[date] = None) -> tuple[pd.DataFrame, dict]:
     """
     Devuelve (df_jugadores, totales_equipo).
-    df_jugadores: estadísticas por jugador sin columnas globales (sin nulls).
-    totales_equipo: dict con total_partidos, total_goles, total_asist,
-                    total_minutos, total_goles_contra.
+    Si last_n_matches o since_date están definidos, agrega solo sobre esos partidos.
     """
     _vacio = {"total_partidos": 0, "total_goles": 0, "total_asist": 0,
               "total_minutos": 0, "total_goles_contra": 0}
     try:
         partidos = list_matches(team_id)
+        # Filtros temporales (F4)
+        if since_date is not None:
+            partidos = [p for p in partidos if p["match_date"] >= since_date.isoformat()]
+        if last_n_matches is not None:
+            partidos = partidos[:last_n_matches]
+
         total_partidos = len(partidos)
         total_goles_contra = sum(m["goals_against"] for m in partidos)
 
-        res = get_client().rpc("get_team_aggregates", {"p_team_id": team_id}).execute()
-        if not res.data:
-            return pd.DataFrame(), {**_vacio, "total_partidos": total_partidos,
-                                    "total_goles_contra": total_goles_contra}
+        if last_n_matches is None and since_date is None:
+            # Vía RPC para toda la temporada
+            res = get_client().rpc("get_team_aggregates", {"p_team_id": team_id}).execute()
+            if not res.data:
+                return pd.DataFrame(), {**_vacio, "total_partidos": total_partidos,
+                                        "total_goles_contra": total_goles_contra}
+            df_raw = pd.DataFrame(res.data)
+        else:
+            # Agregación en Python sobre el subconjunto de partidos
+            df_raw = _aggregate_from_matches(team_id, partidos)
+            if df_raw is None or df_raw.empty:
+                return pd.DataFrame(), {**_vacio, "total_partidos": total_partidos,
+                                        "total_goles_contra": total_goles_contra}
 
-        df = pd.DataFrame(res.data)
-        total_goles   = int(df["gol"].clip(lower=0).sum())
-        total_asist   = int(df["asist"].sum())
-        total_minutos = int(df["total_min"].sum())
-
-        totales = {
-            "total_partidos":    total_partidos,
-            "total_goles":       total_goles,
-            "total_asist":       total_asist,
-            "total_minutos":     total_minutos,
-            "total_goles_contra": total_goles_contra,
-        }
-
-        # Porcentajes por jugador
-        df["% CONVOCADO"] = (df["convocado"] / total_partidos * 100).round(1) if total_partidos else 0.0
-        df["% TITULAR"]   = (df["titular"]  / df["convocado"].replace(0, pd.NA) * 100).fillna(0).round(1)
-        df["% SUPLENTE"]  = (df["suplente"] / df["convocado"].replace(0, pd.NA) * 100).fillna(0).round(1)
-        df["% GOLES"]     = (df["gol"]   / total_goles * 100).round(1) if total_goles else 0.0
-        df["% ASIST"]     = (df["asist"] / total_asist * 100).round(1) if total_asist else 0.0
-        posibles = df["convocado"] * minutos_partido
-        df["POSIBLES MINUTOS"]      = posibles
-        df["% MINUTOS"]             = (df["total_min"] / posibles.replace(0, pd.NA) * 100).fillna(0).round(1)
-        df["PRODUCTIVIDAD OFENSIVA"] = df["gol"] + df["asist"]
-        df["EFICIENCIA GOLEADORA"]   = (df["gol"] / total_partidos).round(2) if total_partidos else 0.0
-
-        df = df.rename(columns={
-            "jugador":    "JUGADOR",
-            "convocado":  "CONVOCADO",
-            "titular":    "TITULAR",
-            "suplente":   "SUPLENTE",
-            "gol":        "GOL",
-            "asist":      "ASIST",
-            "minutos_1a": "MINUTOS 1a PARTE",
-            "minutos_2a": "MINUTOS 2a PARTE",
-            "total_min":  "TOTAL MINUTOS JUGADOS",
-            "amarillas":  "AMARILLAS",
-            "rojas":      "ROJAS",
-        })
-
-        columnas = [
-            "JUGADOR",
-            "CONVOCADO", "% CONVOCADO", "TITULAR", "% TITULAR", "SUPLENTE", "% SUPLENTE",
-            "GOL", "% GOLES", "ASIST", "% ASIST",
-            "AMARILLAS", "ROJAS",
-            "MINUTOS 1a PARTE", "MINUTOS 2a PARTE", "TOTAL MINUTOS JUGADOS",
-            "POSIBLES MINUTOS", "% MINUTOS",
-            "PRODUCTIVIDAD OFENSIVA", "EFICIENCIA GOLEADORA",
-        ]
-        return df[[c for c in columnas if c in df.columns]], totales
+        df, totales = _post_process_aggregates(df_raw, total_partidos, minutos_partido)
+        totales["total_goles_contra"] = total_goles_contra
+        return df, totales
 
     except Exception as e:
         st.error(f"Error al obtener acumulado: {e}")
@@ -398,5 +476,30 @@ def get_player_history(player_id: str) -> list[dict]:
             })
         historial.sort(key=lambda x: x["Fecha"])
         return historial
+    except Exception:
+        return []
+
+
+# ── MVP ───────────────────────────────────────────────────────────────────────
+
+def get_mvp_ranking(team_id: str) -> list[dict]:
+    """Ranking de MVPs de la temporada: [{name, mvps}], ordenado desc."""
+    try:
+        res = (
+            get_client()
+            .table("matches")
+            .select("mvp_player_id, players!matches_mvp_player_id_fkey(name)")
+            .eq("team_id", team_id)
+            .not_.is_("mvp_player_id", "null")
+            .execute()
+        )
+        contador: dict[str, int] = {}
+        for row in (res.data or []):
+            jugador = (row.get("players") or {}).get("name")
+            if jugador:
+                contador[jugador] = contador.get(jugador, 0) + 1
+        ranking = [{"Jugador": n, "MVPs": v} for n, v in contador.items()]
+        ranking.sort(key=lambda x: x["MVPs"], reverse=True)
+        return ranking
     except Exception:
         return []
