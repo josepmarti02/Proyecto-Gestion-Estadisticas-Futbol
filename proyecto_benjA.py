@@ -85,6 +85,17 @@ def partido_mas_goles(partidos: list) -> dict | None:
     return max(partidos, key=lambda p: p["goals_for"] + p["goals_against"])
 
 
+def calcular_balance(partidos: list) -> dict:
+    """Balance de liga: PJ / V / E / D / GF / GC / DIF / PTS."""
+    v = sum(1 for p in partidos if p["goals_for"] > p["goals_against"])
+    e = sum(1 for p in partidos if p["goals_for"] == p["goals_against"])
+    d = sum(1 for p in partidos if p["goals_for"] < p["goals_against"])
+    gf = sum(p["goals_for"] for p in partidos)
+    gc = sum(p["goals_against"] for p in partidos)
+    return {"PJ": len(partidos), "V": v, "E": e, "D": d,
+            "GF": gf, "GC": gc, "DIF": gf - gc, "PTS": v * 3 + e}
+
+
 # ── Configuración de la app ───────────────────────────────────────────────────
 
 st.set_page_config(
@@ -251,6 +262,12 @@ def page_1():
         rc2.metric("Mejor resultado", fmt_marcador(p_mejor), p_mejor["match_date"])
         rc3.metric("Partido más goleador", fmt_marcador(p_goles), p_goles["match_date"])
 
+    # D7: Balance de liga
+    if partidos_raw:
+        st.subheader("📋 Balance de la temporada")
+        bal = calcular_balance(partidos_raw)
+        st.dataframe(pd.DataFrame([bal]), hide_index=True, width="stretch")
+
     with st.expander("📋 Resumen del equipo", expanded=False):
         resumen = estadisticas_generales(totales)
         df_resumen = pd.DataFrame({"Estadística": resumen.keys(), "Total": resumen.values()})
@@ -273,6 +290,16 @@ def page_2():
     if df.empty:
         st.info("📁 Aún no hay partidos registrados.")
         return
+
+    # D2: Filtro por posición
+    players_data = db.list_players(equipo["id"])
+    name_to_id = {p["name"]: p["id"] for p in players_data}
+    positions_available = sorted({p.get("position", "") for p in players_data if p.get("position", "")})
+    if positions_available:
+        pos_filter = st.multiselect("Filtrar por posición:", options=positions_available, default=[])
+        if pos_filter:
+            jugadores_con_pos = {p["name"] for p in players_data if p.get("position", "") in pos_filter}
+            df = df[df["JUGADOR"].isin(jugadores_con_pos)]
 
     jugadores = df["JUGADOR"].dropna().astype(str).tolist()
     select_jugador = st.multiselect("Selecciona jugador(es):", options=jugadores, default=jugadores)
@@ -306,6 +333,24 @@ def page_2():
             .sort_values("GOL", ascending=False)
         )
         st.bar_chart(df_goles_chart)
+
+    # D4: Evolución individual partido a partido
+    st.subheader("📈 Evolución individual")
+    all_jugadores = df["JUGADOR"].dropna().astype(str).tolist()
+    jugador_evol = st.selectbox(
+        "Selecciona un jugador para ver su evolución:",
+        options=all_jugadores,
+        index=None,
+        key="evol_selectbox",
+    )
+    if jugador_evol and jugador_evol in name_to_id:
+        historial = db.get_player_history(name_to_id[jugador_evol])
+        if historial:
+            df_hist = pd.DataFrame(historial)
+            st.line_chart(df_hist.set_index("Fecha")[["Minutos", "Goles", "Asistencias"]])
+            st.dataframe(df_hist, hide_index=True, width="stretch")
+        else:
+            st.info("Este jugador no tiene partidos registrados como convocado.")
 
 
 def page_3():
@@ -381,6 +426,7 @@ def page_3():
         local_visitante = st.toggle("¿Tu equipo es el local?", value=st.session_state.get("local_visitante", False))
         goles_a_favor = st.number_input("⚽ Goles a favor", min_value=0, step=1, value=st.session_state.get("goles_a_favor", 0))
         goles_en_contra = st.number_input("🥅 Goles en contra", min_value=0, step=1, value=st.session_state.get("goles_en_contra", 0))
+        notas = st.text_area("📝 Notas del partido (opcional)", value="", placeholder="Observaciones, clima, táctica…")
 
         resultado = (
             f"{equipo['name']} {goles_a_favor} - {goles_en_contra} {rival}"
@@ -397,6 +443,8 @@ def page_3():
             "ASIST":            [0] * len(jugadores),
             "MINUTOS 1a PARTE": [0] * len(jugadores),
             "MINUTOS 2a PARTE": [0] * len(jugadores),
+            "AMARILLAS":        [0] * len(jugadores),
+            "ROJAS":            [0] * len(jugadores),
         })
 
         st.markdown("### ✏️ Estadísticas individuales")
@@ -427,6 +475,8 @@ def page_3():
                         "asistencias": int(row["ASIST"]),
                         "minutos_1a":  int(row["MINUTOS 1a PARTE"]),
                         "minutos_2a":  int(row["MINUTOS 2a PARTE"]),
+                        "amarillas":   int(row["AMARILLAS"]),
+                        "rojas":       int(row["ROJAS"]),
                     }
                     for _, row in df_editado.iterrows()
                 ]
@@ -438,6 +488,7 @@ def page_3():
                     goals_for=int(goles_a_favor),
                     goals_against=int(goles_en_contra),
                     stats=stats,
+                    notes=notas.strip(),
                 )
                 if match:
                     st.success(f"✅ {resultado} — Partido guardado correctamente.")
@@ -503,6 +554,8 @@ def page_4():
 
     st.markdown(f"### 📊 Detalles: **{partido['Rival']}** ({partido['Fecha']})")
     st.info(f"📍 **Marcador:** {partido['Marcador']}")
+    if match_data.get("notes"):
+        st.markdown(f"📝 **Notas:** {match_data['notes']}")
 
     player_ids_map = {}
     filas = []
@@ -518,6 +571,8 @@ def page_4():
             "ASIST":            s["asistencias"],
             "MINUTOS 1a PARTE": s["minutos_1a"],
             "MINUTOS 2a PARTE": s["minutos_2a"],
+            "AMARILLAS":        s.get("amarillas", 0),
+            "ROJAS":            s.get("rojas", 0),
         })
     df_detalle = pd.DataFrame(filas)
 
@@ -580,6 +635,17 @@ def page_4():
                 for _, row in asistentes.iterrows():
                     st.write(f"{'🎯' * int(row['ASIST'])} {row['JUGADOR']}")
 
+        # D3: Tarjetas
+        df_tarjetas = df_detalle[
+            (df_detalle["CONVOCADO"] == "SÍ") &
+            ((df_detalle["AMARILLAS"] > 0) | (df_detalle["ROJAS"] > 0))
+        ][["JUGADOR", "AMARILLAS", "ROJAS"]]
+        if not df_tarjetas.empty:
+            st.markdown("**🟨 Tarjetas**")
+            for _, row in df_tarjetas.iterrows():
+                badges = "🟨" * int(row["AMARILLAS"]) + "🟥" * int(row["ROJAS"])
+                st.write(f"{badges} {row['JUGADOR']}")
+
         st.markdown("**⏱️ Minutos jugados**")
         df_min = df_detalle[df_detalle["CONVOCADO"] == "SÍ"][
             ["JUGADOR", "MINUTOS 1a PARTE", "MINUTOS 2a PARTE"]
@@ -603,6 +669,7 @@ def page_4():
             st.dataframe(df_detalle, width="stretch")
     else:
         st.warning("Estás editando este partido. Modifica los datos y pulsa Guardar.")
+        notas_edit = st.text_area("📝 Notas del partido", value=match_data.get("notes", ""))
         df_edit = st.data_editor(df_detalle, width="stretch", num_rows="fixed")
         if st.button("💾 Guardar cambios"):
             stats_upd = [
@@ -615,6 +682,8 @@ def page_4():
                     "asistencias": int(row["ASIST"]),
                     "minutos_1a":  int(row["MINUTOS 1a PARTE"]),
                     "minutos_2a":  int(row["MINUTOS 2a PARTE"]),
+                    "amarillas":   int(row["AMARILLAS"]),
+                    "rojas":       int(row["ROJAS"]),
                 }
                 for _, row in df_edit.iterrows()
             ]
@@ -626,6 +695,7 @@ def page_4():
                 goals_for=match_data["goals_for"],
                 goals_against=match_data["goals_against"],
                 stats=stats_upd,
+                notes=notas_edit.strip(),
             )
             if ok:
                 st.success("✅ Partido guardado correctamente.")
@@ -633,6 +703,9 @@ def page_4():
                 st.rerun()
             else:
                 st.error("❌ No se pudo guardar.")
+
+
+POSICIONES = ["", "Portero", "Defensa", "Centrocampista", "Delantero"]
 
 
 def page_plantilla():
@@ -644,6 +717,7 @@ def page_plantilla():
 
     with st.form("form_añadir_jugador", clear_on_submit=True):
         nuevo = st.text_input("Nombre del nuevo jugador")
+        posicion_nueva = st.selectbox("Posición", options=POSICIONES)
         if st.form_submit_button("➕ Añadir jugador"):
             nuevo = nuevo.strip()
             nombres_actuales = [p["name"] for p in players]
@@ -652,7 +726,7 @@ def page_plantilla():
             elif nuevo in nombres_actuales:
                 st.warning(f"⚠️ '{nuevo}' ya está en la plantilla.")
             else:
-                result = db.add_player(equipo["id"], nuevo)
+                result = db.add_player(equipo["id"], nuevo, posicion_nueva)
                 if result:
                     st.success(f"✅ '{nuevo}' añadido a la plantilla.")
                     st.rerun()
@@ -685,11 +759,35 @@ def page_plantilla():
                     st.rerun()
 
         for jugador in players:
-            col_nombre, col_btn = st.columns([5, 1])
+            col_nombre, col_pos, col_edit_pos, col_btn = st.columns([4, 2, 1, 1])
             col_nombre.write(jugador["name"])
+            pos_actual = jugador.get("position", "") or "—"
+            col_pos.caption(pos_actual)
+
+            edit_pos_key = f"editando_pos_{jugador['id']}"
+            if col_edit_pos.button("✏️", key=f"btn_editpos_{jugador['id']}", help="Editar posición"):
+                st.session_state[edit_pos_key] = True
+                st.rerun()
             if col_btn.button("🗑️", key=f"del_{jugador['id']}", help=f"Dar de baja a {jugador['name']}"):
                 st.session_state[eliminar_key] = jugador
                 st.rerun()
+
+            if st.session_state.get(edit_pos_key):
+                pos_idx = POSICIONES.index(jugador.get("position", "")) if jugador.get("position", "") in POSICIONES else 0
+                nueva_pos = st.selectbox(
+                    f"Posición de {jugador['name']}",
+                    options=POSICIONES,
+                    index=pos_idx,
+                    key=f"sel_pos_{jugador['id']}",
+                )
+                c_save, c_cancel = st.columns(2)
+                if c_save.button("💾 Guardar", key=f"save_pos_{jugador['id']}"):
+                    db.update_player_position(jugador["id"], nueva_pos)
+                    st.session_state.pop(edit_pos_key, None)
+                    st.rerun()
+                if c_cancel.button("✗ Cancelar", key=f"cancel_pos_{jugador['id']}"):
+                    st.session_state.pop(edit_pos_key, None)
+                    st.rerun()
 
     # Jugadores dados de baja (A3)
     st.divider()

@@ -138,13 +138,24 @@ def list_players(team_id: str, only_active: bool = True) -> list[dict]:
         return []
 
 
-def add_player(team_id: str, name: str) -> Optional[dict]:
+def add_player(team_id: str, name: str, position: str = "") -> Optional[dict]:
     """Añade un jugador a la plantilla."""
     try:
-        res = get_client().table("players").insert({"team_id": team_id, "name": name}).execute()
+        res = get_client().table("players").insert(
+            {"team_id": team_id, "name": name, "position": position}
+        ).execute()
         return res.data[0] if res.data else None
     except Exception:
         return None
+
+
+def update_player_position(player_id: str, position: str) -> bool:
+    """Actualiza la posición de un jugador."""
+    try:
+        get_client().table("players").update({"position": position}).eq("id", player_id).execute()
+        return True
+    except Exception:
+        return False
 
 
 def deactivate_player(player_id: str) -> bool:
@@ -216,11 +227,12 @@ def create_match(
     goals_for: int,
     goals_against: int,
     stats: list[dict],
+    notes: str = "",
 ) -> Optional[dict]:
     """
     Crea un partido completo con sus estadísticas de jugadores.
     stats: lista de dicts con keys player_id, convocado, titular, suplente,
-           goles, asistencias, minutos_1a, minutos_2a.
+           goles, asistencias, minutos_1a, minutos_2a, amarillas, rojas.
     """
     try:
         client = get_client()
@@ -231,6 +243,7 @@ def create_match(
             "is_home": is_home,
             "goals_for": goals_for,
             "goals_against": goals_against,
+            "notes": notes,
         }).execute()
         if not match_res.data:
             return None
@@ -251,6 +264,7 @@ def update_match(
     goals_for: int,
     goals_against: int,
     stats: list[dict],
+    notes: str = "",
 ) -> bool:
     """Actualiza la cabecera y reemplaza las estadísticas de un partido."""
     try:
@@ -261,6 +275,7 @@ def update_match(
             "is_home": is_home,
             "goals_for": goals_for,
             "goals_against": goals_against,
+            "notes": notes,
         }).eq("id", match_id).execute()
         client.table("match_stats").delete().eq("match_id", match_id).execute()
         client.table("match_stats").insert(
@@ -336,12 +351,15 @@ def get_team_aggregates(team_id: str, minutos_partido: int) -> tuple[pd.DataFram
             "minutos_1a": "MINUTOS 1a PARTE",
             "minutos_2a": "MINUTOS 2a PARTE",
             "total_min":  "TOTAL MINUTOS JUGADOS",
+            "amarillas":  "AMARILLAS",
+            "rojas":      "ROJAS",
         })
 
         columnas = [
             "JUGADOR",
             "CONVOCADO", "% CONVOCADO", "TITULAR", "% TITULAR", "SUPLENTE", "% SUPLENTE",
             "GOL", "% GOLES", "ASIST", "% ASIST",
+            "AMARILLAS", "ROJAS",
             "MINUTOS 1a PARTE", "MINUTOS 2a PARTE", "TOTAL MINUTOS JUGADOS",
             "POSIBLES MINUTOS", "% MINUTOS",
             "PRODUCTIVIDAD OFENSIVA", "EFICIENCIA GOLEADORA",
@@ -351,3 +369,34 @@ def get_team_aggregates(team_id: str, minutos_partido: int) -> tuple[pd.DataFram
     except Exception as e:
         st.error(f"Error al obtener acumulado: {e}")
         return pd.DataFrame(), _vacio
+
+
+# ── Historial individual ───────────────────────────────────────────────────────
+
+def get_player_history(player_id: str) -> list[dict]:
+    """Historial de partidos de un jugador (solo convocados), ordenado por fecha."""
+    try:
+        res = (
+            get_client()
+            .table("match_stats")
+            .select("goles, asistencias, amarillas, rojas, minutos_1a, minutos_2a, matches(match_date, rival)")
+            .eq("player_id", player_id)
+            .eq("convocado", True)
+            .execute()
+        )
+        historial = []
+        for row in (res.data or []):
+            m = row.get("matches") or {}
+            historial.append({
+                "Fecha":       m.get("match_date", ""),
+                "Rival":       m.get("rival", ""),
+                "Minutos":     row["minutos_1a"] + row["minutos_2a"],
+                "Goles":       row["goles"],
+                "Asistencias": row["asistencias"],
+                "Amarillas":   row.get("amarillas", 0),
+                "Rojas":       row.get("rojas", 0),
+            })
+        historial.sort(key=lambda x: x["Fecha"])
+        return historial
+    except Exception:
+        return []
