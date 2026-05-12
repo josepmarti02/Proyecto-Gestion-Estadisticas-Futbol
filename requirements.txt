@@ -4,3 +4,4 @@ numpy
 openpyxl
 odfpy
 supabase>=2.0.0
+fpdf2

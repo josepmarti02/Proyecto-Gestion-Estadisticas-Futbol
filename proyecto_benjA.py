@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import db
+import pdf_export
 
 columnas_datos_individuales = [
     "CONVOCADO", "% CONVOCADO", "TITULAR", "% TITULAR", "SUPLENTE", "% SUPLENTE",
@@ -215,12 +216,22 @@ def page_1():
         st.info("📁 Aún no hay partidos registrados. Ve a **Añadir partido** para empezar.")
         return
 
-    # Tarjetas de totales del equipo (A1)
-    c1, c2, c3, c4 = st.columns(4)
+    # Tarjetas de totales del equipo (A1) + botón PDF (B2)
+    c1, c2, c3, c4, c_pdf = st.columns([2, 2, 2, 2, 1])
     c1.metric("Partidos", totales["total_partidos"])
     c2.metric("Goles a favor", totales["total_goles"])
     c3.metric("Goles en contra", totales["total_goles_contra"])
     c4.metric("Asistencias", totales["total_asist"])
+    with c_pdf:
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        pdf_bytes = pdf_export.generar_pdf_estadisticas(equipo, df, totales)
+        st.download_button(
+            "📄 PDF",
+            data=pdf_bytes,
+            file_name=f"estadisticas_{equipo['name'].replace(' ', '_')}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
     # C2: Racha y récords
     if partidos_raw:
@@ -712,7 +723,7 @@ def page_plantilla():
 
 
 def page_config():
-    """A4: Configuración del equipo."""
+    """A4 + B1: Configuración del equipo y visibilidad pública."""
     equipo = get_equipo()
     st.header("⚙️ Configuración del equipo")
 
@@ -729,6 +740,11 @@ def page_config():
             min_value=20, max_value=90,
             value=equipo.get("minutos_partido", 50),
         )
+        publico = st.toggle(
+            "Hacer el equipo público (visible para padres sin login)",
+            value=bool(equipo.get("public", False)),
+            help="Los padres podrán ver las estadísticas desde un enlace directo sin necesidad de cuenta.",
+        )
         guardado = st.form_submit_button("💾 Guardar cambios")
 
     if guardado:
@@ -742,23 +758,173 @@ def page_config():
                 category=categoria.strip(),
                 max_titulares=int(max_titulares),
                 minutos_partido=int(minutos_partido),
+                public=publico,
             )
             if ok:
-                # Actualizar session_state para que el resto de páginas lo vean ya
                 st.session_state["current_team"] = {
                     **equipo,
                     "name": nombre,
                     "category": categoria.strip(),
                     "max_titulares": int(max_titulares),
                     "minutos_partido": int(minutos_partido),
+                    "public": publico,
                 }
                 st.success("✅ Configuración guardada.")
                 st.rerun()
             else:
                 st.error("❌ No se pudo guardar la configuración.")
 
+    # B1: URL pública compartible
+    if equipo.get("public"):
+        base_url = st.secrets.get("app_url", "https://proyecto-gestion-estadisticas-futbol.streamlit.app")
+        share_url = f"{base_url}?team={equipo['id']}"
+        st.divider()
+        st.subheader("🔗 Enlace para padres")
+        st.success("El equipo es visible públicamente. Comparte esta URL:")
+        st.code(share_url, language=None)
+
+
+def page_publica(equipo: dict):
+    """B1: Vista de solo lectura para padres (sin autenticación)."""
+    st.title(f"⚽ {equipo['name']} — {equipo['category']}")
+    st.caption("Vista pública · Solo lectura")
+    st.divider()
+
+    tab_g, tab_i, tab_h = st.tabs(["📊 General", "🪄 Individuales", "📜 Histórico"])
+
+    with tab_g:
+        df, totales = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
+        partidos_raw = db.list_matches(equipo["id"])
+        if df.empty:
+            st.info("No hay datos disponibles.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Partidos", totales["total_partidos"])
+            c2.metric("Goles a favor", totales["total_goles"])
+            c3.metric("Goles en contra", totales["total_goles_contra"])
+            c4.metric("Asistencias", totales["total_asist"])
+
+            if partidos_raw:
+                tipo_racha, n_racha = calcular_racha(partidos_raw)
+                p_mejor = mejor_resultado(partidos_raw)
+                p_goles = partido_mas_goles(partidos_raw)
+
+                def _fmt(p: dict) -> str:
+                    gf, gc = p["goals_for"], p["goals_against"]
+                    return (f"{equipo['name']} {gf}-{gc} {p['rival']}"
+                            if p["is_home"] else f"{p['rival']} {gc}-{gf} {equipo['name']}")
+
+                st.subheader("🏆 Récords de la temporada")
+                icono = {"Victoria": "✅", "Empate": "➖", "Derrota": "❌"}.get(tipo_racha, "")
+                rc1, rc2, rc3 = st.columns(3)
+                rc1.metric("Racha actual", f"{icono} {n_racha} {tipo_racha.lower()}")
+                rc2.metric("Mejor resultado", _fmt(p_mejor), p_mejor["match_date"])
+                rc3.metric("Partido más goleador", _fmt(p_goles), p_goles["match_date"])
+
+            st.subheader("📈 Estadísticas acumuladas por jugador")
+            st.dataframe(df, width="stretch")
+            st.subheader("⏱️ % de minutos por jugador")
+            st.bar_chart(df.set_index("JUGADOR")[["% MINUTOS"]].sort_values("% MINUTOS"))
+
+    with tab_i:
+        df, totales = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
+        if df.empty:
+            st.info("No hay datos disponibles.")
+        else:
+            jugadores = df["JUGADOR"].dropna().astype(str).tolist()
+            sel = st.multiselect("Selecciona jugador(es):", options=jugadores, default=jugadores,
+                                 key="pub_multiselect")
+            if sel:
+                df_sel = df[df["JUGADOR"].isin(sel)]
+                cols_ind = [c for c in columnas_datos_individuales if c in df.columns]
+                st.dataframe(df_sel[["JUGADOR"] + cols_ind], width="stretch")
+            df_extra = metricas_extra(df, totales["total_partidos"])
+            sel_rank = st.multiselect("🏆 Mostrar rankings", options=opciones_ranking, key="pub_ranking")
+            if sel_rank:
+                for i in range(0, len(sel_rank), 3):
+                    cols = st.columns(min(len(sel_rank) - i, 3))
+                    for j, col in enumerate(cols):
+                        if i + j < len(sel_rank):
+                            metrica = sel_rank[i + j]
+                            col.markdown(f"🏅 {metrica}")
+                            col.dataframe(ranking(df_extra, metrica), width="stretch")
+
+    with tab_h:
+        partidos = db.list_matches(equipo["id"])
+        if not partidos:
+            st.info("No hay partidos registrados.")
+        else:
+            resumen_pub = []
+            for p in partidos:
+                gf, gc = p["goals_for"], p["goals_against"]
+                resultado = "✅ Victoria" if gf > gc else ("➖ Empate" if gf == gc else "❌ Derrota")
+                marcador = (f"{equipo['name']} {gf} - {gc} {p['rival']}"
+                            if p["is_home"] else f"{p['rival']} {gc} - {gf} {equipo['name']}")
+                resumen_pub.append({"id": p["id"], "Fecha": p["match_date"],
+                                    "Rival": p["rival"], "Resultado": resultado, "Marcador": marcador})
+            st.dataframe(
+                pd.DataFrame(resumen_pub)[["Fecha", "Rival", "Resultado", "Marcador"]],
+                width="stretch",
+            )
+            if len(partidos) > 1:
+                st.subheader("📈 Evolución de goles")
+                df_evol = pd.DataFrame([
+                    {"Partido": f"{p['match_date']} vs {p['rival']}",
+                     "Goles a favor": p["goals_for"], "Goles en contra": p["goals_against"]}
+                    for p in reversed(partidos)
+                ]).set_index("Partido")
+                st.line_chart(df_evol)
+            opciones_pub = [f"{r['Fecha']} - {r['Rival']}" for r in resumen_pub]
+            sel_partido = st.selectbox("🔍 Ver detalles de un partido", opciones_pub, index=None,
+                                       key="pub_selectbox")
+            if sel_partido:
+                partido_pub = resumen_pub[opciones_pub.index(sel_partido)]
+                match_data, stats_data = db.get_match(partido_pub["id"])
+                if match_data:
+                    st.markdown(f"### {partido_pub['Marcador']}")
+                    filas_pub = []
+                    for s in stats_data:
+                        nombre = s["players"]["name"] if s.get("players") else s["player_id"]
+                        filas_pub.append({
+                            "JUGADOR": nombre,
+                            "GOL": s["goles"], "ASIST": s["asistencias"],
+                            "MINUTOS 1a PARTE": s["minutos_1a"], "MINUTOS 2a PARTE": s["minutos_2a"],
+                        })
+                    df_det = pd.DataFrame(filas_pub)
+                    goleadores_p = df_det[df_det["GOL"] > 0].sort_values("GOL", ascending=False)
+                    asistentes_p = df_det[df_det["ASIST"] > 0].sort_values("ASIST", ascending=False)
+                    cg, ca = st.columns(2)
+                    with cg:
+                        st.markdown("**⚽ Goleadores**")
+                        if goleadores_p.empty:
+                            st.caption("Sin goles")
+                        else:
+                            for _, row in goleadores_p.iterrows():
+                                st.write(f"{'⚽' * int(row['GOL'])} {row['JUGADOR']}")
+                    with ca:
+                        st.markdown("**🎯 Asistencias**")
+                        if asistentes_p.empty:
+                            st.caption("Sin asistencias")
+                        else:
+                            for _, row in asistentes_p.iterrows():
+                                st.write(f"{'🎯' * int(row['ASIST'])} {row['JUGADOR']}")
+                    with st.expander("📋 Estadísticas completas"):
+                        st.dataframe(df_det, width="stretch")
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+# B1: Vista pública para padres (sin login)
+_team_param = st.query_params.get("team")
+if _team_param and not db.current_user():
+    _equipo_pub = db.get_public_team(_team_param)
+    if _equipo_pub:
+        page_publica(_equipo_pub)
+    else:
+        st.error("Este equipo no existe o no está habilitado para vista pública.")
+        st.info("Si eres el entrenador, inicia sesión para acceder.")
+        mostrar_login()
+    st.stop()
 
 if not db.current_user():
     mostrar_login()

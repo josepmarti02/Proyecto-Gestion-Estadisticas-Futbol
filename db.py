@@ -26,6 +26,23 @@ def get_client() -> Client:
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
+def get_public_team(team_id: str) -> Optional[dict]:
+    """Lee un equipo marcado como público sin autenticación."""
+    try:
+        client = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
+        res = (
+            client.table("teams")
+            .select("*")
+            .eq("id", team_id)
+            .eq("public", True)
+            .single()
+            .execute()
+        )
+        return res.data
+    except Exception:
+        return None
+
+
 def sign_in(email: str, password: str) -> tuple[bool, str]:
     """Inicia sesión. Devuelve (éxito, mensaje_error)."""
     try:
