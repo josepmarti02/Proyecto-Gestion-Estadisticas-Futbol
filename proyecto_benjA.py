@@ -107,9 +107,9 @@ FORMACIONES = {
                 "Banda Derecha", "Centrocampista", "Banda Izquierda", "Delantero"],
     "1-3-2-2": ["Portero", "Lateral Derecho", "Defensa Central", "Lateral Izquierdo",
                 "Centrocampista", "Centrocampista", "Delantero", "Delantero"],
-    "1-2-3-2": ["Portero", "Lateral Derecho", "Lateral Izquierdo",
+    "1-2-3-2": ["Portero", "Defensa Central", "Defensa Central",
                 "Banda Derecha", "Centrocampista", "Banda Izquierda", "Delantero", "Delantero"],
-    "1-2-3-1-1": ["Portero", "Lateral Derecho", "Lateral Izquierdo",
+    "1-2-3-1-1": ["Portero", "Defensa Central", "Defensa Central",
                   "Banda Derecha", "Centrocampista", "Banda Izquierda",
                   "Mediapunta", "Delantero"],
 }
