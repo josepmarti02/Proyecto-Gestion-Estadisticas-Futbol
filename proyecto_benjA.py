@@ -28,7 +28,7 @@ columnas_datos_individuales = [
 
 opciones_ranking = ["GOL", "ASIST", "TOTAL MINUTOS JUGADOS",
                     "% MINUTOS", "% TITULAR", "PRODUCTIVIDAD OFENSIVA",
-                    "EFICIENCIA GOLEADORA"]
+                    "EFICIENCIA GOLEADORA", "MVPs"]
 
 
 # ── Funciones puras de estadísticas ──────────────────────────────────────────
@@ -109,6 +109,9 @@ FORMACIONES = {
                 "Centrocampista", "Centrocampista", "Delantero", "Delantero"],
     "1-2-3-2": ["Portero", "Lateral Derecho", "Lateral Izquierdo",
                 "Banda Derecha", "Centrocampista", "Banda Izquierda", "Delantero", "Delantero"],
+    "1-2-3-1-1": ["Portero", "Lateral Derecho", "Lateral Izquierdo",
+                  "Banda Derecha", "Centrocampista", "Banda Izquierda",
+                  "Mediapunta", "Delantero"],
 }
 
 
@@ -180,6 +183,7 @@ def calcular_distintivos(df: pd.DataFrame) -> dict[str, str]:
         ("GOL",                   "🥇"),
         ("ASIST",                 "🎯"),
         ("TOTAL MINUTOS JUGADOS", "⏱️"),
+        ("MVPs",                  "🌟"),
     ]
     for col, emoji in reglas:
         if col not in df.columns:
@@ -190,6 +194,25 @@ def calcular_distintivos(df: pd.DataFrame) -> dict[str, str]:
         for nombre in df[df[col] == max_v]["JUGADOR"]:
             badges[nombre] = badges.get(nombre, "") + emoji
     return badges
+
+
+def ranking_por_posicion(df: pd.DataFrame, players_data: list[dict],
+                         metrica: str, top: int = 3) -> dict[str, pd.DataFrame]:
+    """Devuelve {posicion: df_top3} para cada posición presente en la plantilla."""
+    if df.empty or metrica not in df.columns:
+        return {}
+    posiciones_de = lambda p: ([p["position"]] if p.get("position") else []) + list(p.get("alt_positions") or [])
+    pos_to_jugadores: dict[str, list[str]] = {}
+    for p in players_data:
+        for pos in posiciones_de(p):
+            pos_to_jugadores.setdefault(pos, []).append(p["name"])
+    resultado = {}
+    for pos, nombres in sorted(pos_to_jugadores.items()):
+        df_pos = df[df["JUGADOR"].isin(nombres)][["JUGADOR", metrica]].sort_values(metrica, ascending=False).head(top)
+        if not df_pos.empty:
+            df_pos = df_pos.rename(columns={"JUGADOR": "Jugador", metrica: metrica})
+            resultado[pos] = df_pos.reset_index(drop=True)
+    return resultado
 
 
 def calcular_balance(partidos: list) -> dict:
@@ -491,6 +514,23 @@ def page_2():
         else:
             st.info("Este jugador no tiene partidos registrados como convocado.")
 
+    # G7: Rankings por posición
+    st.subheader("🎯 Rankings por posición")
+    metrica_pos = st.selectbox(
+        "Métrica", options=opciones_ranking, index=0, key="ranking_pos_metrica"
+    )
+    rankings_pos = ranking_por_posicion(df_extra, players_data, metrica_pos)
+    if rankings_pos:
+        posiciones_list = list(rankings_pos.keys())
+        for i in range(0, len(posiciones_list), 3):
+            cols = st.columns(min(3, len(posiciones_list) - i))
+            for j, col in enumerate(cols):
+                pos = posiciones_list[i + j]
+                col.markdown(f"**{pos}**")
+                col.dataframe(rankings_pos[pos], hide_index=True, width="stretch")
+    else:
+        st.info("No hay posiciones asignadas en la plantilla o no hay datos.")
+
 
 def page_3():
     equipo = get_equipo()
@@ -507,36 +547,32 @@ def page_3():
     jugadores = [p["name"] for p in players_data]
     player_ids = {p["name"]: p["id"] for p in players_data}
 
-    for key in ["no_convocados", "suplentes"]:
-        st.session_state.setdefault(key, [])
+    # Pre-marcar lesionados/sancionados la primera vez que se carga la página
+    if "p3_status_preloaded" not in st.session_state:
+        no_disp = [p["name"] for p in players_data
+                   if (p.get("status") or "disponible") != "disponible"]
+        st.session_state["no_convocados"] = no_disp
+        st.session_state["p3_status_preloaded"] = True
+
+    for key in ["no_convocados", "suplentes", "lineup"]:
+        st.session_state.setdefault(key, [] if key != "lineup" else {})
     for key in ["goles_a_favor", "goles_en_contra"]:
         st.session_state.setdefault(key, 0)
     st.session_state.setdefault("rival", "")
     st.session_state.setdefault("local_visitante", False)
+    st.session_state.setdefault("lineup_formacion", list(FORMACIONES.keys())[0])
 
-    # F7: Sugerir alineación
-    with st.expander("💡 Sugerir alineación (rotación + posiciones)", expanded=False):
-        col_f, col_btn = st.columns([2, 1])
-        formacion_sel = col_f.selectbox(
-            "Formación", options=list(FORMACIONES.keys()),
-            help="Para fútbol 8. La sugerencia prioriza la rotación justa (% minutos)."
-        )
-        sugerir_btn = col_btn.button("💡 Sugerir titular", use_container_width=True)
-        if sugerir_btn:
-            df_stats_sug, _ = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
-            stats_min = (dict(zip(df_stats_sug["JUGADOR"], df_stats_sug["% MINUTOS"]))
-                         if not df_stats_sug.empty else {})
-            asignacion = sugerir_alineacion(players_data, stats_min, FORMACIONES[formacion_sel])
-            titulares_sug = [j["name"] for _, j in asignacion if j]
-            if len(titulares_sug) == MAX_TITULARES:
-                st.session_state["no_convocados"] = []
-                st.session_state["suplentes"] = [j for j in jugadores if j not in titulares_sug]
-                st.success(f"Alineación {formacion_sel} sugerida — pulsa 'Actualizar convocatoria'.")
-                for pos, j in asignacion:
-                    nombre = j["name"] if j else "—"
-                    st.write(f"**{pos}** → {nombre}")
-            else:
-                st.warning("No se ha podido completar la alineación (faltan jugadores).")
+    # G4: info de jugadores no disponibles
+    no_disp_list = [p["name"] for p in players_data if (p.get("status") or "disponible") != "disponible"]
+    lesionados = [p["name"] for p in players_data if (p.get("status") or "disponible") == "lesionado"]
+    sancionados = [p["name"] for p in players_data if (p.get("status") or "disponible") == "sancionado"]
+    if lesionados or sancionados:
+        partes = []
+        if lesionados:
+            partes.append(f"🩹 {len(lesionados)} lesionado(s)")
+        if sancionados:
+            partes.append(f"🟡 {len(sancionados)} sancionado(s)")
+        st.info(f"{', '.join(partes)} — pre-excluidos de la convocatoria")
 
     st.markdown("### 👥 Convocatoria y alineación")
 
@@ -548,40 +584,85 @@ def page_3():
     )
 
     jugadores_disponibles = [j for j in jugadores if j not in no_convocados]
-    max_suplentes = max(len(jugadores_disponibles) - MAX_TITULARES, 0)
-    suplentes_validos = [j for j in st.session_state["suplentes"] if j in jugadores_disponibles]
-    if max_suplentes == 0:
-        suplentes_validos = []
-    elif len(suplentes_validos) > max_suplentes:
-        suplentes_validos = suplentes_validos[:max_suplentes]
 
-    if max_suplentes == 0:
-        st.info("ℹ️ No hay margen para suplentes")
-        suplentes = []
-    else:
-        suplentes = st.multiselect(
-            "Jugadores suplentes",
-            options=jugadores_disponibles,
-            default=suplentes_validos,
-            max_selections=max_suplentes,
-            key="multiselect_suplentes",
+    # G2: Formación y lineup builder
+    col_f, col_btn = st.columns([2, 1])
+    formacion_sel = col_f.selectbox(
+        "Formación", options=list(FORMACIONES.keys()),
+        index=list(FORMACIONES.keys()).index(st.session_state["lineup_formacion"])
+        if st.session_state["lineup_formacion"] in FORMACIONES else 0,
+        help="Para fútbol 8. Elige la formación y asigna jugadores por posición.",
+        key="formacion_selectbox",
+    )
+    # Reset lineup si cambia la formación
+    if formacion_sel != st.session_state["lineup_formacion"]:
+        st.session_state["lineup"] = {}
+        st.session_state["lineup_formacion"] = formacion_sel
+
+    if col_btn.button("💡 Sugerir alineación", use_container_width=True):
+        df_stats_sug, _ = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
+        stats_min = (dict(zip(df_stats_sug["JUGADOR"], df_stats_sug["% MINUTOS"]))
+                     if not df_stats_sug.empty else {})
+        disponibles_p = [p for p in players_data if p["name"] in jugadores_disponibles]
+        asignacion = sugerir_alineacion(disponibles_p, stats_min, FORMACIONES[formacion_sel])
+        st.session_state["lineup"] = {i: j["name"] for i, (_, j) in enumerate(asignacion) if j}
+
+    # Selectboxes por posición (G2)
+    posiciones_formacion = FORMACIONES[formacion_sel]
+    lineup: dict[int, str] = st.session_state.get("lineup", {})
+    nueva_lineup: dict[int, str] = {}
+
+    st.markdown("**Asignación de titulares por posición:**")
+    for idx, pos in enumerate(posiciones_formacion):
+        ya_asignados_otros = [v for k, v in nueva_lineup.items()]
+        opciones_pos = ["— Sin asignar —"] + [
+            j for j in jugadores_disponibles
+            if j not in ya_asignados_otros
+        ]
+        # Añadir el actual si está asignado para que sea seleccionable
+        actual = lineup.get(idx)
+        if actual and actual in jugadores_disponibles and actual not in ya_asignados_otros:
+            default_idx = opciones_pos.index(actual) if actual in opciones_pos else 0
+        else:
+            default_idx = 0
+        sel = st.selectbox(
+            f"{pos}",
+            options=opciones_pos,
+            index=default_idx,
+            key=f"lineup_pos_{idx}",
         )
+        if sel != "— Sin asignar —":
+            nueva_lineup[idx] = sel
+        else:
+            nueva_lineup[idx] = ""
+
+    st.session_state["lineup"] = {k: v for k, v in nueva_lineup.items() if v}
+
+    titulares_asignados = [v for v in nueva_lineup.values() if v]
+    suplentes_auto = [j for j in jugadores_disponibles if j not in titulares_asignados]
+
+    if suplentes_auto:
+        st.info(f"Suplentes: {', '.join(suplentes_auto)}")
+
+    num_titulares = len(titulares_asignados)
+    posiciones_vacias = [posiciones_formacion[i] for i, v in nueva_lineup.items() if not v]
+
+    if posiciones_vacias:
+        st.warning(f"⚠️ Posiciones sin asignar: {', '.join(posiciones_vacias)}")
+    elif num_titulares != MAX_TITULARES:
+        st.warning(f"⚠️ Hay {num_titulares} titulares. Se necesitan {MAX_TITULARES}.")
 
     if st.button("🔄 Actualizar convocatoria"):
         st.session_state["no_convocados"] = no_convocados
-        st.session_state["suplentes"] = suplentes
         st.success("✅ Convocatoria actualizada.")
         st.rerun()
 
-    titulares = [j for j in jugadores_disponibles if j not in suplentes]
-    num_titulares = len(titulares)
-
-    if num_titulares < MAX_TITULARES:
-        st.warning(f"⚠️ Hay {num_titulares} titulares. Se necesitan {MAX_TITULARES}.")
-    elif num_titulares > MAX_TITULARES:
-        st.warning(f"⚠️ Hay {num_titulares} titulares. Máximo {MAX_TITULARES}.")
+    # Mapeo posición → nombre (para G6: position_played)
+    lineup_reverse = {v: posiciones_formacion[k] for k, v in nueva_lineup.items() if v}
 
     st.divider()
+
+    alineacion_ok = (not posiciones_vacias) and (num_titulares == MAX_TITULARES)
 
     with st.form("form_partido_manual"):
         fecha_partido = st.date_input("📅 Fecha del partido", value=datetime.today())
@@ -600,8 +681,8 @@ def page_3():
         df_manual = pd.DataFrame({
             "JUGADOR":          jugadores,
             "CONVOCADO":        ["SÍ" if j not in no_convocados else "NO" for j in jugadores],
-            "TITULAR":          ["SÍ" if j in titulares else "NO" for j in jugadores],
-            "SUPLENTE":         ["SÍ" if j in suplentes else "NO" for j in jugadores],
+            "TITULAR":          ["SÍ" if j in titulares_asignados else "NO" for j in jugadores],
+            "SUPLENTE":         ["SÍ" if j in suplentes_auto and j not in titulares_asignados else "NO" for j in jugadores],
             "GOL":              [0] * len(jugadores),
             "ASIST":            [0] * len(jugadores),
             "MINUTOS 1a PARTE": [0] * len(jugadores),
@@ -613,17 +694,22 @@ def page_3():
         st.markdown("### ✏️ Estadísticas individuales")
         df_editado = st.data_editor(df_manual, num_rows="fixed", width="stretch")
 
-        # F6: MVP del partido (entre los convocados)
-        opciones_mvp = ["— Sin MVP —"] + [j for j in jugadores if j not in no_convocados]
-        mvp_sel = st.selectbox("🌟 MVP del partido (opcional)", options=opciones_mvp)
+        # G1: MVPs del partido (hasta 3, entre los convocados)
+        opciones_mvp = [j for j in jugadores if j not in no_convocados]
+        mvps_sel = st.multiselect(
+            "🌟 MVPs del partido (opcional, máx. 3)",
+            options=opciones_mvp,
+            max_selections=3,
+        )
 
-        submitted = st.form_submit_button("✅ Guardar partido")
+        submitted = st.form_submit_button("✅ Guardar partido", disabled=not alineacion_ok)
+
+    if not alineacion_ok:
+        st.warning("Asigna todos los titulares antes de guardar el partido.")
 
     if submitted:
         if not rival.strip():
             st.error("❌ Introduce el nombre del rival.")
-        elif num_titulares != MAX_TITULARES:
-            st.error(f"⚠️ El número de titulares debe ser exactamente {MAX_TITULARES} (hay {num_titulares}).")
         else:
             mitad = MINUTOS_PARTIDO / 2
             invalidos = df_editado[
@@ -635,20 +721,21 @@ def page_3():
             else:
                 stats = [
                     {
-                        "player_id":   player_ids[row["JUGADOR"]],
-                        "convocado":   row["CONVOCADO"] == "SÍ",
-                        "titular":     row["TITULAR"] == "SÍ",
-                        "suplente":    row["SUPLENTE"] == "SÍ",
-                        "goles":       int(row["GOL"]),
-                        "asistencias": int(row["ASIST"]),
-                        "minutos_1a":  int(row["MINUTOS 1a PARTE"]),
-                        "minutos_2a":  int(row["MINUTOS 2a PARTE"]),
-                        "amarillas":   int(row["AMARILLAS"]),
-                        "rojas":       int(row["ROJAS"]),
+                        "player_id":      player_ids[row["JUGADOR"]],
+                        "convocado":      row["CONVOCADO"] == "SÍ",
+                        "titular":        row["TITULAR"] == "SÍ",
+                        "suplente":       row["SUPLENTE"] == "SÍ",
+                        "goles":          int(row["GOL"]),
+                        "asistencias":    int(row["ASIST"]),
+                        "minutos_1a":     int(row["MINUTOS 1a PARTE"]),
+                        "minutos_2a":     int(row["MINUTOS 2a PARTE"]),
+                        "amarillas":      int(row["AMARILLAS"]),
+                        "rojas":          int(row["ROJAS"]),
+                        "position_played": lineup_reverse.get(row["JUGADOR"], ""),
                     }
                     for _, row in df_editado.iterrows()
                 ]
-                mvp_id = player_ids.get(mvp_sel) if mvp_sel != "— Sin MVP —" else None
+                mvp_ids = [player_ids[n] for n in mvps_sel if n in player_ids]
                 match = db.create_match(
                     team_id=equipo["id"],
                     rival=rival.strip(),
@@ -658,11 +745,13 @@ def page_3():
                     goals_against=int(goles_en_contra),
                     stats=stats,
                     notes=notas.strip(),
-                    mvp_player_id=mvp_id,
+                    mvp_player_ids=mvp_ids,
                 )
                 if match:
                     st.success(f"✅ {resultado} — Partido guardado correctamente.")
-                    for k in ["no_convocados", "suplentes", "rival", "goles_a_favor", "goles_en_contra", "local_visitante"]:
+                    for k in ["no_convocados", "suplentes", "rival", "goles_a_favor",
+                              "goles_en_contra", "local_visitante", "lineup",
+                              "lineup_formacion", "p3_status_preloaded"]:
                         st.session_state.pop(k, None)
                     st.rerun()
                 else:
@@ -726,19 +815,23 @@ def page_4():
     st.info(f"📍 **Marcador:** {partido['Marcador']}")
     if match_data.get("notes"):
         st.markdown(f"📝 **Notas:** {match_data['notes']}")
-    # F6: MVP destacado
-    mvp_id_actual = match_data.get("mvp_player_id")
-    if mvp_id_actual:
-        nombre_mvp = next((s["players"]["name"] for s in stats_data
-                           if s.get("players") and s["player_id"] == mvp_id_actual), None)
-        if nombre_mvp:
-            st.success(f"🌟 **MVP del partido:** {nombre_mvp}")
+    # G1: MVPs destacados (array)
+    mvp_ids_actuales = match_data.get("mvp_player_ids") or []
+    if mvp_ids_actuales:
+        nombres_mvp = [
+            s["players"]["name"] for s in stats_data
+            if s.get("players") and s["player_id"] in mvp_ids_actuales
+        ]
+        if nombres_mvp:
+            st.success(f"🌟 **MVPs del partido:** {', '.join(nombres_mvp)}")
 
     player_ids_map = {}
+    position_played_map = {}
     filas = []
     for s in stats_data:
         nombre = s["players"]["name"] if s.get("players") else s["player_id"]
         player_ids_map[nombre] = s["player_id"]
+        position_played_map[nombre] = s.get("position_played", "")
         filas.append({
             "JUGADOR":          nombre,
             "CONVOCADO":        "SÍ" if s["convocado"] else "NO",
@@ -750,6 +843,7 @@ def page_4():
             "MINUTOS 2a PARTE": s["minutos_2a"],
             "AMARILLAS":        s.get("amarillas", 0),
             "ROJAS":            s.get("rojas", 0),
+            "POSICIÓN INICIAL": s.get("position_played", ""),
         })
     df_detalle = pd.DataFrame(filas)
 
@@ -792,6 +886,16 @@ def page_4():
             st.rerun()
 
     if not editando:
+        # G6: Alineación inicial (titulares con position_played)
+        titulares_inicio = [
+            (nombre, pos) for nombre, pos in position_played_map.items()
+            if pos and any(s["players"]["name"] == nombre and s["titular"] for s in stats_data if s.get("players"))
+        ]
+        if titulares_inicio:
+            with st.expander("📋 Alineación inicial", expanded=False):
+                for nombre, pos in titulares_inicio:
+                    st.write(f"**{pos}** → {nombre}")
+
         # C1: Ficha visual del partido
         goleadores = df_detalle[df_detalle["GOL"] > 0][["JUGADOR", "GOL"]].sort_values("GOL", ascending=False)
         asistentes = df_detalle[df_detalle["ASIST"] > 0][["JUGADOR", "ASIST"]].sort_values("ASIST", ascending=False)
@@ -848,37 +952,58 @@ def page_4():
         st.warning("Estás editando este partido. Modifica los datos y pulsa Guardar.")
         notas_edit = st.text_area("📝 Notas del partido", value=match_data.get("notes", ""))
 
-        # F6: editar MVP
+        # G1: editar MVPs (multiselect hasta 3)
         convocados_edit = [r["JUGADOR"] for _, r in df_detalle.iterrows() if r["CONVOCADO"] == "SÍ"]
-        opciones_mvp_edit = ["— Sin MVP —"] + convocados_edit
-        nombre_mvp_actual = next(
-            (s["players"]["name"] for s in stats_data
-             if s.get("players") and s["player_id"] == match_data.get("mvp_player_id")),
-            None,
+        mvp_ids_act = match_data.get("mvp_player_ids") or []
+        nombres_mvp_act = [
+            s["players"]["name"] for s in stats_data
+            if s.get("players") and s["player_id"] in mvp_ids_act
+        ]
+        mvps_edit = st.multiselect(
+            "🌟 MVPs del partido (máx. 3)",
+            options=convocados_edit,
+            default=[n for n in nombres_mvp_act if n in convocados_edit],
+            max_selections=3,
         )
-        idx_mvp = (opciones_mvp_edit.index(nombre_mvp_actual)
-                   if nombre_mvp_actual in opciones_mvp_edit else 0)
-        mvp_edit = st.selectbox("🌟 MVP del partido", options=opciones_mvp_edit, index=idx_mvp)
 
-        df_edit = st.data_editor(df_detalle, width="stretch", num_rows="fixed")
+        # G6: editar posiciones iniciales de titulares
+        st.markdown("**Posiciones iniciales de titulares (solo informativo):**")
+        titulares_edit = [r["JUGADOR"] for _, r in df_detalle.iterrows() if r["TITULAR"] == "SÍ"]
+        pos_edit_map: dict[str, str] = {}
+        for nombre_tit in titulares_edit:
+            pos_actual_tit = position_played_map.get(nombre_tit, "")
+            opciones_pos_edit = ["— Sin asignar —"] + POSICIONES
+            idx_pos = opciones_pos_edit.index(pos_actual_tit) if pos_actual_tit in opciones_pos_edit else 0
+            sel_pos = st.selectbox(
+                f"{nombre_tit}",
+                options=opciones_pos_edit,
+                index=idx_pos,
+                key=f"edit_pos_jugador_{nombre_tit}",
+            )
+            pos_edit_map[nombre_tit] = "" if sel_pos == "— Sin asignar —" else sel_pos
+
+        df_edit = st.data_editor(
+            df_detalle.drop(columns=["POSICIÓN INICIAL"], errors="ignore"),
+            width="stretch", num_rows="fixed",
+        )
         if st.button("💾 Guardar cambios"):
             stats_upd = [
                 {
-                    "player_id":   player_ids_map[row["JUGADOR"]],
-                    "convocado":   row["CONVOCADO"] == "SÍ",
-                    "titular":     row["TITULAR"] == "SÍ",
-                    "suplente":    row["SUPLENTE"] == "SÍ",
-                    "goles":       int(row["GOL"]),
-                    "asistencias": int(row["ASIST"]),
-                    "minutos_1a":  int(row["MINUTOS 1a PARTE"]),
-                    "minutos_2a":  int(row["MINUTOS 2a PARTE"]),
-                    "amarillas":   int(row["AMARILLAS"]),
-                    "rojas":       int(row["ROJAS"]),
+                    "player_id":      player_ids_map[row["JUGADOR"]],
+                    "convocado":      row["CONVOCADO"] == "SÍ",
+                    "titular":        row["TITULAR"] == "SÍ",
+                    "suplente":       row["SUPLENTE"] == "SÍ",
+                    "goles":          int(row["GOL"]),
+                    "asistencias":    int(row["ASIST"]),
+                    "minutos_1a":     int(row["MINUTOS 1a PARTE"]),
+                    "minutos_2a":     int(row["MINUTOS 2a PARTE"]),
+                    "amarillas":      int(row["AMARILLAS"]),
+                    "rojas":          int(row["ROJAS"]),
+                    "position_played": pos_edit_map.get(row["JUGADOR"], ""),
                 }
                 for _, row in df_edit.iterrows()
             ]
-            mvp_id_edit = (player_ids_map.get(mvp_edit)
-                           if mvp_edit and mvp_edit != "— Sin MVP —" else None)
+            mvp_ids_edit = [player_ids_map[n] for n in mvps_edit if n in player_ids_map]
             ok = db.update_match(
                 match_id=partido["id"],
                 rival=match_data["rival"],
@@ -888,7 +1013,7 @@ def page_4():
                 goals_against=match_data["goals_against"],
                 stats=stats_upd,
                 notes=notas_edit.strip(),
-                mvp_player_id=mvp_id_edit,
+                mvp_player_ids=mvp_ids_edit,
             )
             if ok:
                 st.success("✅ Partido guardado correctamente.")
@@ -945,7 +1070,7 @@ def page_plantilla():
         df_stats, _ = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
         distintivos = calcular_distintivos(df_stats)
         if distintivos:
-            st.caption("🥇 max goleador · 🎯 max asistente · ⏱️ más minutos")
+            st.caption("🥇 max goleador · 🎯 max asistente · ⏱️ más minutos · 🌟 más MVPs")
 
         eliminar_key = "confirmar_eliminar"
         jugador_a_eliminar = st.session_state.get(eliminar_key)
@@ -966,22 +1091,48 @@ def page_plantilla():
                     st.rerun()
 
         for jugador in players:
-            col_nombre, col_pos, col_edit_pos, col_btn = st.columns([4, 3, 1, 1])
+            col_nombre, col_pos, col_edit_pos, col_status, col_btn = st.columns([4, 3, 1, 1, 1])
             pos_primaria = jugador.get("position", "") or "—"
             alts = jugador.get("alt_positions") or []
             badge = distintivos.get(jugador["name"], "")
+            status = jugador.get("status", "disponible") or "disponible"
+            status_emoji = {"lesionado": "🩹", "sancionado": "🟡"}.get(status, "")
             col_nombre.write(f"{jugador['name']} {badge}".rstrip())
-            col_pos.caption(
-                f"{pos_primaria}" + (f"  ·  alt: {', '.join(alts)}" if alts else "")
-            )
+            pos_caption = f"{pos_primaria}" + (f"  ·  alt: {', '.join(alts)}" if alts else "")
+            if status_emoji:
+                pos_caption += f"  ·  {status_emoji} {status}"
+            col_pos.caption(pos_caption)
 
             edit_pos_key = f"editando_pos_{jugador['id']}"
+            edit_status_key = f"editando_status_{jugador['id']}"
             if col_edit_pos.button("✏️", key=f"btn_editpos_{jugador['id']}", help="Editar posiciones"):
                 st.session_state[edit_pos_key] = True
+                st.session_state.pop(edit_status_key, None)
+                st.rerun()
+            if col_status.button("⚕️", key=f"btn_status_{jugador['id']}", help="Cambiar estado"):
+                st.session_state[edit_status_key] = True
+                st.session_state.pop(edit_pos_key, None)
                 st.rerun()
             if col_btn.button("🗑️", key=f"del_{jugador['id']}", help=f"Dar de baja a {jugador['name']}"):
                 st.session_state[eliminar_key] = jugador
                 st.rerun()
+
+            if st.session_state.get(edit_status_key):
+                opciones_status = ["disponible", "lesionado", "sancionado"]
+                nuevo_status = st.selectbox(
+                    f"Estado de {jugador['name']}",
+                    options=opciones_status,
+                    index=opciones_status.index(status) if status in opciones_status else 0,
+                    key=f"sel_status_{jugador['id']}",
+                )
+                c_save_s, c_cancel_s = st.columns(2)
+                if c_save_s.button("💾 Guardar", key=f"save_status_{jugador['id']}"):
+                    db.update_player_status(jugador["id"], nuevo_status)
+                    st.session_state.pop(edit_status_key, None)
+                    st.rerun()
+                if c_cancel_s.button("✗ Cancelar", key=f"cancel_status_{jugador['id']}"):
+                    st.session_state.pop(edit_status_key, None)
+                    st.rerun()
 
             if st.session_state.get(edit_pos_key):
                 opciones_primaria = ["— Sin asignar —"] + POSICIONES

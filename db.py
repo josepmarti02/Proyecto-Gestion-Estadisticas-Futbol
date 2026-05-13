@@ -166,6 +166,15 @@ def update_player_positions(player_id: str, position: str,
         return False
 
 
+def update_player_status(player_id: str, status: str) -> bool:
+    """Actualiza el estado del jugador: 'disponible', 'lesionado' o 'sancionado'."""
+    try:
+        get_client().table("players").update({"status": status}).eq("id", player_id).execute()
+        return True
+    except Exception:
+        return False
+
+
 def deactivate_player(player_id: str) -> bool:
     """Da de baja a un jugador conservando su histórico de partidos."""
     try:
@@ -236,12 +245,14 @@ def create_match(
     goals_against: int,
     stats: list[dict],
     notes: str = "",
-    mvp_player_id: Optional[str] = None,
+    mvp_player_ids: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """
     Crea un partido completo con sus estadísticas de jugadores.
     stats: lista de dicts con keys player_id, convocado, titular, suplente,
-           goles, asistencias, minutos_1a, minutos_2a, amarillas, rojas.
+           goles, asistencias, minutos_1a, minutos_2a, amarillas, rojas,
+           y opcionalmente position_played.
+    mvp_player_ids: lista de hasta 3 UUIDs de jugadores MVP.
     """
     try:
         client = get_client()
@@ -253,7 +264,7 @@ def create_match(
             "goals_for": goals_for,
             "goals_against": goals_against,
             "notes": notes,
-            "mvp_player_id": mvp_player_id,
+            "mvp_player_ids": mvp_player_ids or [],
         }).execute()
         if not match_res.data:
             return None
@@ -275,7 +286,7 @@ def update_match(
     goals_against: int,
     stats: list[dict],
     notes: str = "",
-    mvp_player_id: Optional[str] = None,
+    mvp_player_ids: Optional[list[str]] = None,
 ) -> bool:
     """Actualiza la cabecera y reemplaza las estadísticas de un partido."""
     try:
@@ -287,7 +298,7 @@ def update_match(
             "goals_for": goals_for,
             "goals_against": goals_against,
             "notes": notes,
-            "mvp_player_id": mvp_player_id,
+            "mvp_player_ids": mvp_player_ids or [],
         }).eq("id", match_id).execute()
         client.table("match_stats").delete().eq("match_id", match_id).execute()
         client.table("match_stats").insert(
@@ -317,6 +328,7 @@ _COLUMNAS_ACUMULADO = [
     "MINUTOS 1a PARTE", "MINUTOS 2a PARTE", "TOTAL MINUTOS JUGADOS",
     "POSIBLES MINUTOS", "% MINUTOS",
     "PRODUCTIVIDAD OFENSIVA", "EFICIENCIA GOLEADORA",
+    "MVPs",
 ]
 
 
@@ -358,6 +370,7 @@ def _post_process_aggregates(df: pd.DataFrame, total_partidos: int,
         "total_min":  "TOTAL MINUTOS JUGADOS",
         "amarillas":  "AMARILLAS",
         "rojas":      "ROJAS",
+        "mvps":       "MVPs",
     })
     return df[[c for c in _COLUMNAS_ACUMULADO if c in df.columns]], totales
 
@@ -440,6 +453,16 @@ def get_team_aggregates(team_id: str, minutos_partido: int,
                 return pd.DataFrame(), {**_vacio, "total_partidos": total_partidos,
                                         "total_goles_contra": total_goles_contra}
 
+        # Contar MVPs por jugador desde los partidos ya filtrados (respeta filtros temporales)
+        mvp_count: dict[str, int] = {}
+        for p in partidos:
+            for pid in (p.get("mvp_player_ids") or []):
+                mvp_count[pid] = mvp_count.get(pid, 0) + 1
+        if "player_id" in df_raw.columns:
+            df_raw["mvps"] = df_raw["player_id"].map(mvp_count).fillna(0).astype(int)
+        else:
+            df_raw["mvps"] = 0
+
         df, totales = _post_process_aggregates(df_raw, total_partidos, minutos_partido)
         totales["total_goles_contra"] = total_goles_contra
         return df, totales
@@ -483,22 +506,39 @@ def get_player_history(player_id: str) -> list[dict]:
 # ── MVP ───────────────────────────────────────────────────────────────────────
 
 def get_mvp_ranking(team_id: str) -> list[dict]:
-    """Ranking de MVPs de la temporada: [{name, mvps}], ordenado desc."""
+    """Ranking de MVPs de la temporada: [{Jugador, MVPs}], ordenado desc."""
     try:
-        res = (
-            get_client()
-            .table("matches")
-            .select("mvp_player_id, players!matches_mvp_player_id_fkey(name)")
+        client = get_client()
+        # Fetch all matches with mvp_player_ids arrays
+        matches_res = (
+            client.table("matches")
+            .select("mvp_player_ids")
             .eq("team_id", team_id)
-            .not_.is_("mvp_player_id", "null")
             .execute()
         )
-        contador: dict[str, int] = {}
-        for row in (res.data or []):
-            jugador = (row.get("players") or {}).get("name")
-            if jugador:
-                contador[jugador] = contador.get(jugador, 0) + 1
-        ranking = [{"Jugador": n, "MVPs": v} for n, v in contador.items()]
+        # Count occurrences of each player_id across all arrays
+        id_count: dict[str, int] = {}
+        all_ids: list[str] = []
+        for row in (matches_res.data or []):
+            for pid in (row.get("mvp_player_ids") or []):
+                id_count[pid] = id_count.get(pid, 0) + 1
+                all_ids.append(pid)
+        if not id_count:
+            return []
+        # Resolve names
+        unique_ids = list(id_count.keys())
+        players_res = (
+            client.table("players")
+            .select("id, name")
+            .in_("id", unique_ids)
+            .execute()
+        )
+        id_to_name = {p["id"]: p["name"] for p in (players_res.data or [])}
+        ranking = [
+            {"Jugador": id_to_name.get(pid, pid), "MVPs": cnt}
+            for pid, cnt in id_count.items()
+            if id_to_name.get(pid)
+        ]
         ranking.sort(key=lambda x: x["MVPs"], reverse=True)
         return ranking
     except Exception:
