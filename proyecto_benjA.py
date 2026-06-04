@@ -196,25 +196,6 @@ def calcular_distintivos(df: pd.DataFrame) -> dict[str, str]:
     return badges
 
 
-def ranking_por_posicion(df: pd.DataFrame, players_data: list[dict],
-                         metrica: str, top: int = 3) -> dict[str, pd.DataFrame]:
-    """Devuelve {posicion: df_top3} para cada posición presente en la plantilla."""
-    if df.empty or metrica not in df.columns:
-        return {}
-    posiciones_de = lambda p: ([p["position"]] if p.get("position") else []) + list(p.get("alt_positions") or [])
-    pos_to_jugadores: dict[str, list[str]] = {}
-    for p in players_data:
-        for pos in posiciones_de(p):
-            pos_to_jugadores.setdefault(pos, []).append(p["name"])
-    resultado = {}
-    for pos, nombres in sorted(pos_to_jugadores.items()):
-        df_pos = df[df["JUGADOR"].isin(nombres)][["JUGADOR", metrica]].sort_values(metrica, ascending=False).head(top)
-        if not df_pos.empty:
-            df_pos = df_pos.rename(columns={"JUGADOR": "Jugador", metrica: metrica})
-            resultado[pos] = df_pos.reset_index(drop=True)
-    return resultado
-
-
 def calcular_balance(partidos: list) -> dict:
     """Balance de liga: PJ / V / E / D / GF / GC / DIF / PTS."""
     v = sum(1 for p in partidos if p["goals_for"] > p["goals_against"])
@@ -451,7 +432,20 @@ def page_2():
         st.warning("Selecciona al menos un jugador.")
 
     df_extra = metricas_extra(df, totales["total_partidos"])
-    seleccion_rankings = st.multiselect("🏆 Mostrar rankings", options=opciones_ranking)
+
+    col_rank_sel, col_rank_pos = st.columns([2, 1])
+    seleccion_rankings = col_rank_sel.multiselect("🏆 Mostrar rankings", options=opciones_ranking)
+    filtro_pos_ranking = col_rank_pos.selectbox(
+        "Posición", options=["Todas"] + positions_available,
+        key="ranking_filtro_pos",
+    )
+    if filtro_pos_ranking != "Todas":
+        jugadores_en_pos = {p["name"] for p in players_data
+                            if any(p_pos == filtro_pos_ranking for p_pos in posiciones_de(p))}
+        df_ranking_pos = df_extra[df_extra["JUGADOR"].isin(jugadores_en_pos)]
+    else:
+        df_ranking_pos = df_extra
+
     if seleccion_rankings:
         num_cols = min(len(seleccion_rankings), 3)
         for i in range(0, len(seleccion_rankings), 3):
@@ -460,7 +454,7 @@ def page_2():
                 if i + j < len(seleccion_rankings):
                     metrica = seleccion_rankings[i + j]
                     col.markdown(f"🏅 {metrica}")
-                    col.dataframe(ranking(df_extra, metrica), width="stretch")
+                    col.dataframe(ranking(df_ranking_pos, metrica), width="stretch")
     else:
         st.warning("Selecciona al menos un ranking para mostrar resultados.")
 
@@ -514,22 +508,118 @@ def page_2():
         else:
             st.info("Este jugador no tiene partidos registrados como convocado.")
 
-    # G7: Rankings por posición
-    st.subheader("🎯 Rankings por posición")
-    metrica_pos = st.selectbox(
-        "Métrica", options=opciones_ranking, index=0, key="ranking_pos_metrica"
-    )
-    rankings_pos = ranking_por_posicion(df_extra, players_data, metrica_pos)
-    if rankings_pos:
-        posiciones_list = list(rankings_pos.keys())
-        for i in range(0, len(posiciones_list), 3):
-            cols = st.columns(min(3, len(posiciones_list) - i))
-            for j, col in enumerate(cols):
-                pos = posiciones_list[i + j]
-                col.markdown(f"**{pos}**")
-                col.dataframe(rankings_pos[pos], hide_index=True, width="stretch")
-    else:
-        st.info("No hay posiciones asignadas en la plantilla o no hay datos.")
+
+def historial_rival(partidos: list, rival: str) -> list[dict]:
+    """Partidos previos contra el mismo rival (comparación sin mayúsculas ni espacios)."""
+    rival_norm = rival.strip().lower()
+    return [p for p in partidos if p.get("rival", "").strip().lower() == rival_norm]
+
+
+# ── H4: Partido en directo — funciones helper ─────────────────────────────────
+
+def _calcular_titulares_actuales(titulares_inicio: list[str], eventos: list[dict]) -> list[str]:
+    """Devuelve los jugadores en el campo ahora mismo, aplicando los cambios registrados."""
+    en_campo = list(titulares_inicio)
+    for ev in sorted(eventos, key=lambda e: e.get("minuto", 0)):
+        if ev["event_type"] != "cambio":
+            continue
+        sale = ev.get("player_name")
+        entra = ev.get("player2_name")
+        if sale and sale in en_campo:
+            en_campo.remove(sale)
+        if entra and entra not in en_campo:
+            en_campo.append(entra)
+    return en_campo
+
+
+def _calcular_stats_live(
+    players_data: list[dict],
+    jugadores_convocados: list[str],
+    titulares_inicio: list[str],
+    suplentes: list[str],
+    eventos: list[dict],
+    lineup_reverse: dict[str, str],
+    tiempo_total_seg: float,
+    minutos_partido: int,
+) -> list[dict]:
+    """Calcula las estadísticas finales de cada jugador a partir del log de eventos."""
+    # Determinar minuto de medio tiempo
+    mt_event = next((e for e in eventos if e["event_type"] == "medio_tiempo"), None)
+    min_mt = mt_event["minuto"] if mt_event else minutos_partido // 2
+    min_total = max(int(tiempo_total_seg / 60), minutos_partido) if tiempo_total_seg > 0 else minutos_partido
+
+    # Rastrear periodos en el campo {nombre: [(inicio, fin)]}
+    on_field_since: dict[str, int] = {name: 0 for name in titulares_inicio}
+    player_periods: dict[str, list[tuple[int, int]]] = {}
+
+    for ev in sorted(eventos, key=lambda e: e.get("minuto", 0)):
+        if ev["event_type"] != "cambio":
+            continue
+        sale = ev.get("player_name")
+        entra = ev.get("player2_name")
+        min_ev = ev.get("minuto", 0)
+        if sale and sale in on_field_since:
+            start = on_field_since.pop(sale)
+            player_periods.setdefault(sale, []).append((start, min_ev))
+        if entra:
+            on_field_since[entra] = min_ev
+
+    for name, start in on_field_since.items():
+        player_periods.setdefault(name, []).append((start, min_total))
+
+    def split_minutos(periods: list[tuple[int, int]]) -> tuple[int, int]:
+        m1a = m2a = 0
+        for s, e in periods:
+            s1, e1 = min(max(s, 0), min_mt), min(max(e, 0), min_mt)
+            m1a += max(0, e1 - s1)
+            s2, e2 = min(max(s, min_mt), min_total), min(max(e, min_mt), min_total)
+            m2a += max(0, e2 - s2)
+        return int(m1a), int(m2a)
+
+    # Contar goles, asistencias y tarjetas por nombre de jugador
+    goles_count: dict[str, int] = {}
+    asist_count: dict[str, int] = {}
+    amarillas_count: dict[str, int] = {}
+    rojas_count: dict[str, int] = {}
+
+    for ev in eventos:
+        if ev["event_type"] == "gol_a_favor":
+            n = ev.get("player_name")
+            if n:
+                goles_count[n] = goles_count.get(n, 0) + 1
+            n2 = ev.get("player2_name")
+            if n2:
+                asist_count[n2] = asist_count.get(n2, 0) + 1
+        elif ev["event_type"] == "amarilla":
+            n = ev.get("player_name")
+            if n:
+                amarillas_count[n] = amarillas_count.get(n, 0) + 1
+        elif ev["event_type"] == "roja":
+            n = ev.get("player_name")
+            if n:
+                rojas_count[n] = rojas_count.get(n, 0) + 1
+
+    stats = []
+    for p in players_data:
+        name = p["name"]
+        convocado = name in jugadores_convocados
+        titular = name in titulares_inicio
+        suplente = name in suplentes
+        m1a, m2a = split_minutos(player_periods.get(name, []))
+        stats.append({
+            "player_id":       p["id"],
+            "convocado":       convocado,
+            "titular":         titular,
+            "suplente":        suplente and not titular,
+            "goles":           goles_count.get(name, 0),
+            "asistencias":     asist_count.get(name, 0),
+            "minutos_1a":      m1a,
+            "minutos_2a":      m2a,
+            "amarillas":       amarillas_count.get(name, 0),
+            "rojas":           rojas_count.get(name, 0),
+            "position_played": lineup_reverse.get(name, "") if titular else "",
+        })
+    return stats
 
 
 def page_3():
@@ -546,12 +636,13 @@ def page_3():
 
     jugadores = [p["name"] for p in players_data]
     player_ids = {p["name"]: p["id"] for p in players_data}
+    partidos_all = db.list_matches(equipo["id"])
 
     # Pre-marcar lesionados/sancionados la primera vez que se carga la página
     if "p3_status_preloaded" not in st.session_state:
         no_disp = [p["name"] for p in players_data
                    if (p.get("status") or "disponible") != "disponible"]
-        st.session_state["no_convocados"] = no_disp
+        st.session_state["multiselect_no_convocados"] = no_disp
         st.session_state["p3_status_preloaded"] = True
 
     for key in ["no_convocados", "suplentes", "lineup"]:
@@ -579,7 +670,7 @@ def page_3():
     no_convocados = st.multiselect(
         "Jugadores no convocados",
         options=jugadores,
-        default=[j for j in st.session_state["no_convocados"] if j in jugadores],
+        default=[j for j in st.session_state.get("multiselect_no_convocados", []) if j in jugadores],
         key="multiselect_no_convocados",
     )
 
@@ -605,7 +696,14 @@ def page_3():
                      if not df_stats_sug.empty else {})
         disponibles_p = [p for p in players_data if p["name"] in jugadores_disponibles]
         asignacion = sugerir_alineacion(disponibles_p, stats_min, FORMACIONES[formacion_sel])
-        st.session_state["lineup"] = {i: j["name"] for i, (_, j) in enumerate(asignacion) if j}
+        new_lineup = {i: j["name"] for i, (_, j) in enumerate(asignacion) if j}
+        st.session_state["lineup"] = new_lineup
+        # Actualizar los keys de los selectboxes directamente (Streamlit ignora index si el key existe)
+        for idx in range(len(FORMACIONES[formacion_sel])):
+            key = f"lineup_pos_{idx}"
+            if st.session_state.get(key, "— Sin asignar —") == "— Sin asignar —":
+                st.session_state[key] = new_lineup.get(idx, "— Sin asignar —")
+        st.rerun()
 
     # Selectboxes por posición (G2)
     posiciones_formacion = FORMACIONES[formacion_sel]
@@ -664,9 +762,25 @@ def page_3():
 
     alineacion_ok = (not posiciones_vacias) and (num_titulares == MAX_TITULARES)
 
+    # H5: Rival fuera del form para mostrar historial en tiempo real
+    st.markdown("### 🏟️ Partido")
+    rival = st.text_input("Rival", key="rival_live", value=st.session_state.get("rival_live", ""))
+    if rival.strip() and partidos_all:
+        partidos_vs = historial_rival(partidos_all, rival)
+        if partidos_vs:
+            with st.expander(f"📋 {len(partidos_vs)} partido(s) previo(s) vs {rival.strip()}", expanded=True):
+                filas_hist = []
+                for p in partidos_vs:
+                    gf, gc = p["goals_for"], p["goals_against"]
+                    res = "✅ Victoria" if gf > gc else ("➖ Empate" if gf == gc else "❌ Derrota")
+                    marcador = (f"{equipo['name']} {gf}-{gc} {p['rival']}"
+                                if p["is_home"] else f"{p['rival']} {gc}-{gf} {equipo['name']}")
+                    filas_hist.append({"Fecha": p["match_date"], "Resultado": res,
+                                       "Marcador": marcador, "Notas": p.get("notes", "")})
+                st.dataframe(pd.DataFrame(filas_hist), hide_index=True, width="stretch")
+
     with st.form("form_partido_manual"):
         fecha_partido = st.date_input("📅 Fecha del partido", value=datetime.today())
-        rival = st.text_input("🏟️ Rival", value=st.session_state.get("rival", ""))
         local_visitante = st.toggle("¿Tu equipo es el local?", value=st.session_state.get("local_visitante", False))
         goles_a_favor = st.number_input("⚽ Goles a favor", min_value=0, step=1, value=st.session_state.get("goles_a_favor", 0))
         goles_en_contra = st.number_input("🥅 Goles en contra", min_value=0, step=1, value=st.session_state.get("goles_en_contra", 0))
@@ -749,9 +863,10 @@ def page_3():
                 )
                 if match:
                     st.success(f"✅ {resultado} — Partido guardado correctamente.")
-                    for k in ["no_convocados", "suplentes", "rival", "goles_a_favor",
-                              "goles_en_contra", "local_visitante", "lineup",
-                              "lineup_formacion", "p3_status_preloaded"]:
+                    for k in ["no_convocados", "multiselect_no_convocados", "suplentes",
+                              "rival", "rival_live", "goles_a_favor", "goles_en_contra",
+                              "local_visitante", "lineup", "lineup_formacion",
+                              "p3_status_preloaded"]:
                         st.session_state.pop(k, None)
                     st.rerun()
                 else:
@@ -1021,6 +1136,266 @@ def page_4():
                 st.rerun()
             else:
                 st.error("❌ No se pudo guardar.")
+
+
+# ── H4: Partido en directo ────────────────────────────────────────────────────
+
+def page_live():
+    import time
+
+    equipo = get_equipo()
+    st.header("⚡ Partido en directo")
+
+    players_data = db.list_players(equipo["id"])
+    if not players_data:
+        st.warning("⚠️ No hay jugadores en la plantilla. Ve a **Plantilla** para añadirlos.")
+        return
+
+    player_ids = {p["name"]: p["id"] for p in players_data}
+
+    # Inicializar session state del partido en directo
+    for k, default in [
+        ("live_eventos", []),
+        ("live_timer_start", None),
+        ("live_timer_offset", 0.0),
+        ("live_timer_running", False),
+        ("live_medio_tiempo_min", None),
+    ]:
+        st.session_state.setdefault(k, default)
+
+    # Recuperar lineup de page_3 (si está definido)
+    lineup = st.session_state.get("lineup", {})
+    formacion_sel = st.session_state.get("lineup_formacion", list(FORMACIONES.keys())[0])
+    posiciones_formacion = FORMACIONES.get(formacion_sel, [])
+    lineup_reverse = {v: posiciones_formacion[k] for k, v in lineup.items() if v}
+
+    no_convocados = st.session_state.get("multiselect_no_convocados", [])
+    jugadores_disponibles = [p["name"] for p in players_data if p["name"] not in no_convocados]
+    titulares_inicio = [v for v in lineup.values() if v]
+    suplentes = [j for j in jugadores_disponibles if j not in titulares_inicio]
+    jugadores_convocados = titulares_inicio + suplentes
+
+    if not titulares_inicio:
+        st.info("ℹ️ No hay alineación definida. Ve a **Añadir partido** para configurar el once inicial y vuelve aquí.")
+
+    # ── Cronómetro ────────────────────────────────────────────────────────────
+    st.subheader("⏱️ Cronómetro")
+
+    def tiempo_actual() -> float:
+        if st.session_state["live_timer_running"] and st.session_state["live_timer_start"]:
+            return st.session_state["live_timer_offset"] + (time.time() - st.session_state["live_timer_start"])
+        return st.session_state["live_timer_offset"]
+
+    t_seg = tiempo_actual()
+    mins, secs = int(t_seg // 60), int(t_seg % 60)
+    st.metric("Tiempo transcurrido", f"{mins:02d}:{secs:02d}")
+
+    col_start, col_pause, col_reset, col_mt = st.columns(4)
+
+    if not st.session_state["live_timer_running"]:
+        if col_start.button("▶️ Iniciar", use_container_width=True):
+            st.session_state["live_timer_start"] = time.time()
+            st.session_state["live_timer_running"] = True
+            st.rerun()
+    else:
+        if col_pause.button("⏸ Pausar", use_container_width=True):
+            st.session_state["live_timer_offset"] += time.time() - st.session_state["live_timer_start"]
+            st.session_state["live_timer_start"] = None
+            st.session_state["live_timer_running"] = False
+            st.rerun()
+
+    if col_reset.button("🔄 Reiniciar", use_container_width=True):
+        st.session_state.update({
+            "live_timer_start": None, "live_timer_offset": 0.0,
+            "live_timer_running": False, "live_medio_tiempo_min": None,
+        })
+        st.rerun()
+
+    if st.session_state["live_medio_tiempo_min"] is None:
+        if col_mt.button("⏱ Medio tiempo", use_container_width=True):
+            mt_min = int(tiempo_actual() // 60)
+            st.session_state["live_medio_tiempo_min"] = mt_min
+            if st.session_state["live_timer_running"]:
+                st.session_state["live_timer_offset"] += time.time() - st.session_state["live_timer_start"]
+                st.session_state["live_timer_start"] = None
+                st.session_state["live_timer_running"] = False
+            st.session_state["live_eventos"].append({
+                "event_type": "medio_tiempo", "minuto": mt_min,
+                "player_id": None, "player_id2": None,
+                "player_name": None, "player2_name": None,
+            })
+            st.rerun()
+    else:
+        col_mt.info(f"Descanso · min {st.session_state['live_medio_tiempo_min']}")
+
+    # ── Panel de eventos ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📋 Registrar eventos")
+
+    titulares_actuales = _calcular_titulares_actuales(titulares_inicio, st.session_state["live_eventos"])
+    suplentes_disponibles = [j for j in jugadores_convocados if j not in titulares_actuales]
+
+    col_gol_f, col_gol_c = st.columns(2)
+
+    with col_gol_f:
+        st.markdown("**⚽ Gol a favor**")
+        goleador = st.selectbox("Goleador", ["— Seleccionar —"] + jugadores_convocados, key="live_goleador")
+        asistente_ops = ["— Ninguno —"] + [j for j in jugadores_convocados if j != goleador]
+        asistente = st.selectbox("Asistente (opcional)", asistente_ops, key="live_asistente")
+        if st.button("Registrar ⚽", use_container_width=True, key="btn_gol_f"):
+            if goleador != "— Seleccionar —":
+                ast_name = asistente if asistente != "— Ninguno —" else None
+                st.session_state["live_eventos"].append({
+                    "event_type": "gol_a_favor",
+                    "minuto": int(tiempo_actual() // 60),
+                    "player_id": player_ids.get(goleador),
+                    "player_id2": player_ids.get(ast_name) if ast_name else None,
+                    "player_name": goleador,
+                    "player2_name": ast_name,
+                })
+                st.rerun()
+
+    with col_gol_c:
+        st.markdown("**🥅 Gol en contra**")
+        st.caption("Sin jugador asociado")
+        if st.button("Registrar 🥅", use_container_width=True, key="btn_gol_c"):
+            st.session_state["live_eventos"].append({
+                "event_type": "gol_en_contra",
+                "minuto": int(tiempo_actual() // 60),
+                "player_id": None, "player_id2": None,
+                "player_name": None, "player2_name": None,
+            })
+            st.rerun()
+
+    col_am, col_ro = st.columns(2)
+
+    with col_am:
+        st.markdown("**🟨 Tarjeta amarilla**")
+        jugador_am = st.selectbox("Jugador", ["— Seleccionar —"] + jugadores_convocados, key="live_amarilla")
+        if st.button("Registrar 🟨", use_container_width=True, key="btn_amarilla"):
+            if jugador_am != "— Seleccionar —":
+                st.session_state["live_eventos"].append({
+                    "event_type": "amarilla",
+                    "minuto": int(tiempo_actual() // 60),
+                    "player_id": player_ids.get(jugador_am), "player_id2": None,
+                    "player_name": jugador_am, "player2_name": None,
+                })
+                st.rerun()
+
+    with col_ro:
+        st.markdown("**🟥 Tarjeta roja**")
+        jugador_ro = st.selectbox("Jugador", ["— Seleccionar —"] + jugadores_convocados, key="live_roja")
+        if st.button("Registrar 🟥", use_container_width=True, key="btn_roja"):
+            if jugador_ro != "— Seleccionar —":
+                st.session_state["live_eventos"].append({
+                    "event_type": "roja",
+                    "minuto": int(tiempo_actual() // 60),
+                    "player_id": player_ids.get(jugador_ro), "player_id2": None,
+                    "player_name": jugador_ro, "player2_name": None,
+                })
+                st.rerun()
+
+    st.markdown("**🔄 Cambio**")
+    col_sale, col_entra = st.columns(2)
+    jugador_sale = col_sale.selectbox("Sale del campo", ["— Seleccionar —"] + titulares_actuales, key="live_sale")
+    jugador_entra = col_entra.selectbox("Entra al campo", ["— Seleccionar —"] + suplentes_disponibles, key="live_entra")
+    if st.button("Registrar cambio 🔄", use_container_width=True, key="btn_cambio"):
+        if jugador_sale != "— Seleccionar —" and jugador_entra != "— Seleccionar —":
+            st.session_state["live_eventos"].append({
+                "event_type": "cambio",
+                "minuto": int(tiempo_actual() // 60),
+                "player_id": player_ids.get(jugador_sale),
+                "player_id2": player_ids.get(jugador_entra),
+                "player_name": jugador_sale,
+                "player2_name": jugador_entra,
+            })
+            st.rerun()
+
+    # ── Log de eventos ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📝 Log de eventos")
+
+    eventos = st.session_state["live_eventos"]
+    labels_ev = {
+        "gol_a_favor": "⚽ Gol a favor",
+        "gol_en_contra": "🥅 Gol en contra",
+        "amarilla": "🟨 Amarilla",
+        "roja": "🟥 Roja",
+        "cambio": "🔄 Cambio",
+        "medio_tiempo": "⏱ Medio tiempo",
+    }
+
+    if not eventos:
+        st.caption("Sin eventos registrados.")
+    else:
+        for i, ev in enumerate(reversed(eventos)):
+            idx_real = len(eventos) - 1 - i
+            col_desc, col_del = st.columns([6, 1])
+            label = labels_ev.get(ev["event_type"], ev["event_type"])
+            jugador_txt = ""
+            if ev.get("player_name"):
+                jugador_txt = f" — {ev['player_name']}"
+            if ev.get("player2_name"):
+                sep = " → " if ev["event_type"] == "cambio" else " + "
+                jugador_txt += f"{sep}{ev['player2_name']}"
+            col_desc.write(f"**Min {ev['minuto']}** · {label}{jugador_txt}")
+            if col_del.button("🗑️", key=f"del_ev_{idx_real}", help="Deshacer evento"):
+                st.session_state["live_eventos"].pop(idx_real)
+                st.rerun()
+
+    # ── Finalizar partido ─────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("✅ Finalizar partido")
+
+    goles_favor_calc = sum(1 for e in eventos if e["event_type"] == "gol_a_favor")
+    goles_contra_calc = sum(1 for e in eventos if e["event_type"] == "gol_en_contra")
+    st.info(f"Resultado del log: **{goles_favor_calc}** goles a favor · **{goles_contra_calc}** en contra")
+
+    with st.form("form_live_finalizar"):
+        rival_live_fin = st.text_input("🏟️ Rival")
+        local_visitante_fin = st.toggle("¿Tu equipo es el local?", value=True)
+        goles_favor_fin = st.number_input("⚽ Goles a favor (verificar)", value=goles_favor_calc, min_value=0, step=1)
+        goles_contra_fin = st.number_input("🥅 Goles en contra (verificar)", value=goles_contra_calc, min_value=0, step=1)
+        fecha_live_fin = st.date_input("📅 Fecha", value=datetime.today())
+        notas_live_fin = st.text_area("📝 Notas (opcional)")
+        mvps_live = st.multiselect("🌟 MVPs (máx. 3)", options=jugadores_convocados, max_selections=3)
+        btn_fin = st.form_submit_button("🏁 Guardar partido")
+
+    if btn_fin:
+        if not rival_live_fin.strip():
+            st.error("❌ Introduce el nombre del rival.")
+        else:
+            stats_live = _calcular_stats_live(
+                players_data=players_data,
+                jugadores_convocados=jugadores_convocados,
+                titulares_inicio=titulares_inicio,
+                suplentes=suplentes,
+                eventos=eventos,
+                lineup_reverse=lineup_reverse,
+                tiempo_total_seg=tiempo_actual(),
+                minutos_partido=equipo["minutos_partido"],
+            )
+            mvp_ids_live = [player_ids[n] for n in mvps_live if n in player_ids]
+            match = db.create_match(
+                team_id=equipo["id"],
+                rival=rival_live_fin.strip(),
+                match_date=fecha_live_fin,
+                is_home=local_visitante_fin,
+                goals_for=int(goles_favor_fin),
+                goals_against=int(goles_contra_fin),
+                stats=stats_live,
+                notes=notas_live_fin.strip(),
+                mvp_player_ids=mvp_ids_live,
+            )
+            if match:
+                db.create_match_events(match["id"], eventos)
+                st.success("✅ Partido guardado correctamente.")
+                for k in ["live_eventos", "live_timer_start", "live_timer_offset",
+                          "live_timer_running", "live_medio_tiempo_min"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+            else:
+                st.error("❌ No se pudo guardar el partido.")
 
 
 POSICIONES = [
@@ -1414,6 +1789,7 @@ pg = st.navigation({
     "Estadísticas por partido": [
         st.Page(page_3, title="Añadir partido", icon="📅"),
         st.Page(page_4, title="Histórico de partidos", icon="📜"),
+        st.Page(page_live, title="En directo", icon="⚡"),
     ],
     "Equipo": [
         st.Page(page_plantilla, title="Plantilla", icon="👥"),

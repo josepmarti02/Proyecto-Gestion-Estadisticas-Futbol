@@ -505,6 +505,21 @@ def get_player_history(player_id: str) -> list[dict]:
 
 # ── MVP ───────────────────────────────────────────────────────────────────────
 
+def create_match_events(match_id: str, events: list[dict]) -> bool:
+    """Guarda el log de eventos del partido en la tabla match_events."""
+    if not events:
+        return True
+    try:
+        client = get_client()
+        rows = [{"match_id": match_id, **{k: v for k, v in e.items()
+                 if k in ("event_type", "minuto", "player_id", "player_id2")}}
+                for e in events]
+        client.table("match_events").insert(rows).execute()
+        return True
+    except Exception:
+        return False
+
+
 def get_mvp_ranking(team_id: str) -> list[dict]:
     """Ranking de MVPs de la temporada: [{Jugador, MVPs}], ordenado desc."""
     try:
