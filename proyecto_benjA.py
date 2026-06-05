@@ -541,12 +541,19 @@ def _calcular_stats_live(
     lineup_reverse: dict[str, str],
     tiempo_total_seg: float,
     minutos_partido: int,
+    num_partes: int = 2,
+    min_mt_override: int = None,
 ) -> list[dict]:
     """Calcula las estadísticas finales de cada jugador a partir del log de eventos."""
-    # Determinar minuto de medio tiempo
-    mt_event = next((e for e in eventos if e["event_type"] == "medio_tiempo"), None)
-    min_mt = mt_event["minuto"] if mt_event else minutos_partido // 2
     min_total = max(int(tiempo_total_seg / 60), minutos_partido) if tiempo_total_seg > 0 else minutos_partido
+    # Determinar minuto de medio tiempo
+    if num_partes == 1:
+        min_mt = min_total  # partido de 1 sola parte: todo va a minutos_1a
+    elif min_mt_override is not None:
+        min_mt = min_mt_override
+    else:
+        mt_event = next((e for e in eventos if e["event_type"] == "medio_tiempo"), None)
+        min_mt = mt_event["minuto"] if mt_event else minutos_partido // 2
 
     # Rastrear periodos en el campo {nombre: [(inicio, fin)]}
     on_field_since: dict[str, int] = {name: 0 for name in titulares_inicio}
@@ -642,8 +649,13 @@ def page_3():
     if "p3_status_preloaded" not in st.session_state:
         no_disp = [p["name"] for p in players_data
                    if (p.get("status") or "disponible") != "disponible"]
+        st.session_state["p3_no_conv_backup"] = no_disp
         st.session_state["multiselect_no_convocados"] = no_disp
         st.session_state["p3_status_preloaded"] = True
+
+    # Restaurar desde backup si Streamlit limpió el widget key al navegar
+    if "multiselect_no_convocados" not in st.session_state and "p3_no_conv_backup" in st.session_state:
+        st.session_state["multiselect_no_convocados"] = st.session_state["p3_no_conv_backup"]
 
     for key in ["no_convocados", "suplentes", "lineup"]:
         st.session_state.setdefault(key, [] if key != "lineup" else {})
@@ -670,14 +682,14 @@ def page_3():
     no_convocados = st.multiselect(
         "Jugadores no convocados",
         options=jugadores,
-        default=[j for j in st.session_state.get("multiselect_no_convocados", []) if j in jugadores],
         key="multiselect_no_convocados",
     )
+    st.session_state["p3_no_conv_backup"] = no_convocados
 
     jugadores_disponibles = [j for j in jugadores if j not in no_convocados]
 
     # G2: Formación y lineup builder
-    col_f, col_btn = st.columns([2, 1])
+    col_f, col_btn, col_clear = st.columns([2, 1, 1])
     formacion_sel = col_f.selectbox(
         "Formación", options=list(FORMACIONES.keys()),
         index=list(FORMACIONES.keys()).index(st.session_state["lineup_formacion"])
@@ -690,19 +702,39 @@ def page_3():
         st.session_state["lineup"] = {}
         st.session_state["lineup_formacion"] = formacion_sel
 
+    if col_clear.button("🔄 Limpiar", use_container_width=True):
+        for idx in range(len(FORMACIONES[formacion_sel])):
+            st.session_state[f"lineup_pos_{idx}"] = "— Sin asignar —"
+        st.session_state["lineup"] = {}
+        st.rerun()
+
     if col_btn.button("💡 Sugerir alineación", use_container_width=True):
         df_stats_sug, _ = db.get_team_aggregates(equipo["id"], equipo["minutos_partido"])
         stats_min = (dict(zip(df_stats_sug["JUGADOR"], df_stats_sug["% MINUTOS"]))
                      if not df_stats_sug.empty else {})
-        disponibles_p = [p for p in players_data if p["name"] in jugadores_disponibles]
-        asignacion = sugerir_alineacion(disponibles_p, stats_min, FORMACIONES[formacion_sel])
-        new_lineup = {i: j["name"] for i, (_, j) in enumerate(asignacion) if j}
-        st.session_state["lineup"] = new_lineup
-        # Actualizar los keys de los selectboxes directamente (Streamlit ignora index si el key existe)
-        for idx in range(len(FORMACIONES[formacion_sel])):
-            key = f"lineup_pos_{idx}"
-            if st.session_state.get(key, "— Sin asignar —") == "— Sin asignar —":
-                st.session_state[key] = new_lineup.get(idx, "— Sin asignar —")
+        formacion = FORMACIONES[formacion_sel]
+        # Separar posiciones ya asignadas vs vacías (I3: no duplicar jugadores)
+        ya_asignados: dict[int, str] = {}
+        for idx in range(len(formacion)):
+            val = st.session_state.get(f"lineup_pos_{idx}", "— Sin asignar —")
+            if val and val != "— Sin asignar —":
+                ya_asignados[idx] = val
+        nombres_ya_asignados = set(ya_asignados.values())
+        posiciones_vacias_idx = [i for i in range(len(formacion)) if i not in ya_asignados]
+        posiciones_vacias_nom = [formacion[i] for i in posiciones_vacias_idx]
+        disponibles_para_sug = [p for p in players_data
+                                if p["name"] in jugadores_disponibles
+                                and p["name"] not in nombres_ya_asignados]
+        if posiciones_vacias_nom:
+            asignacion = sugerir_alineacion(disponibles_para_sug, stats_min, posiciones_vacias_nom)
+            for i, (_, j) in enumerate(asignacion):
+                if j:
+                    idx = posiciones_vacias_idx[i]
+                    st.session_state[f"lineup_pos_{idx}"] = j["name"]
+            combined = {**ya_asignados,
+                        **{posiciones_vacias_idx[i]: j["name"]
+                           for i, (_, j) in enumerate(asignacion) if j}}
+            st.session_state["lineup"] = combined
         st.rerun()
 
     # Selectboxes por posición (G2)
@@ -712,22 +744,22 @@ def page_3():
 
     st.markdown("**Asignación de titulares por posición:**")
     for idx, pos in enumerate(posiciones_formacion):
-        ya_asignados_otros = [v for k, v in nueva_lineup.items()]
+        ya_asignados_otros = [v for v in nueva_lineup.values() if v]
+        key = f"lineup_pos_{idx}"
+        actual = st.session_state.get(key, "— Sin asignar —")
+        # I4: si el jugador de este selectbox ya está en una posición anterior, liberarlo
+        if actual and actual != "— Sin asignar —" and actual in ya_asignados_otros:
+            st.session_state[key] = "— Sin asignar —"
+            actual = "— Sin asignar —"
         opciones_pos = ["— Sin asignar —"] + [
-            j for j in jugadores_disponibles
-            if j not in ya_asignados_otros
+            j for j in jugadores_disponibles if j not in ya_asignados_otros
         ]
-        # Añadir el actual si está asignado para que sea seleccionable
-        actual = lineup.get(idx)
-        if actual and actual in jugadores_disponibles and actual not in ya_asignados_otros:
-            default_idx = opciones_pos.index(actual) if actual in opciones_pos else 0
-        else:
-            default_idx = 0
+        default_idx = opciones_pos.index(actual) if actual in opciones_pos else 0
         sel = st.selectbox(
             f"{pos}",
             options=opciones_pos,
             index=default_idx,
-            key=f"lineup_pos_{idx}",
+            key=key,
         )
         if sel != "— Sin asignar —":
             nueva_lineup[idx] = sel
@@ -863,9 +895,9 @@ def page_3():
                 )
                 if match:
                     st.success(f"✅ {resultado} — Partido guardado correctamente.")
-                    for k in ["no_convocados", "multiselect_no_convocados", "suplentes",
-                              "rival", "rival_live", "goles_a_favor", "goles_en_contra",
-                              "local_visitante", "lineup", "lineup_formacion",
+                    for k in ["no_convocados", "multiselect_no_convocados", "p3_no_conv_backup",
+                              "suplentes", "rival", "rival_live", "goles_a_favor",
+                              "goles_en_contra", "local_visitante", "lineup", "lineup_formacion",
                               "p3_status_preloaded"]:
                         st.session_state.pop(k, None)
                     st.rerun()
@@ -1140,6 +1172,21 @@ def page_4():
 
 # ── H4: Partido en directo ────────────────────────────────────────────────────
 
+def _save_live_draft(team_id: str):
+    """UPSERT del borrador en Supabase después de cada evento."""
+    db.save_live_draft(team_id, {
+        "eventos":               st.session_state.get("live_eventos", []),
+        "lineup":                st.session_state.get("lineup", {}),
+        "formacion":             st.session_state.get("lineup_formacion", ""),
+        "no_convocados":         st.session_state.get("multiselect_no_convocados", []),
+        "timer_offset_secs":     st.session_state.get("live_timer_offset", 0),
+        "timer_start_timestamp": st.session_state.get("live_timer_start"),
+        "timer_running":         st.session_state.get("live_timer_running", False),
+        "medio_tiempo_min":      st.session_state.get("live_medio_tiempo_min"),
+        "num_partes":            st.session_state.get("live_num_partes", 2),
+    })
+
+
 def page_live():
     import time
 
@@ -1160,8 +1207,31 @@ def page_live():
         ("live_timer_offset", 0.0),
         ("live_timer_running", False),
         ("live_medio_tiempo_min", None),
+        ("live_num_partes", 2),
     ]:
         st.session_state.setdefault(k, default)
+
+    # I1: Recuperar borrador de Supabase (una sola vez por sesión)
+    if "live_draft_checked" not in st.session_state:
+        st.session_state["live_draft_checked"] = True
+        draft = db.get_live_draft(equipo["id"])
+        if draft and draft.get("eventos"):
+            st.session_state["live_eventos"] = draft["eventos"]
+            raw_lineup = draft.get("lineup") or {}
+            st.session_state["lineup"] = {int(k): v for k, v in raw_lineup.items()}
+            if draft.get("formacion"):
+                st.session_state["lineup_formacion"] = draft["formacion"]
+            st.session_state["multiselect_no_convocados"] = draft.get("no_convocados") or []
+            st.session_state["live_timer_offset"] = draft.get("timer_offset_secs", 0)
+            st.session_state["live_medio_tiempo_min"] = draft.get("medio_tiempo_min")
+            st.session_state["live_num_partes"] = draft.get("num_partes", 2)
+            if draft.get("timer_running") and draft.get("timer_start_timestamp"):
+                st.session_state["live_timer_start"] = draft["timer_start_timestamp"]
+                st.session_state["live_timer_running"] = True
+            else:
+                st.session_state["live_timer_running"] = False
+                st.session_state["live_timer_start"] = None
+            st.session_state["_live_draft_recovered"] = True
 
     # Recuperar lineup de page_3 (si está definido)
     lineup = st.session_state.get("lineup", {})
@@ -1177,6 +1247,31 @@ def page_live():
 
     if not titulares_inicio:
         st.info("ℹ️ No hay alineación definida. Ve a **Añadir partido** para configurar el once inicial y vuelve aquí.")
+
+    # Banner de borrador recuperado + botón descartar
+    if st.session_state.pop("_live_draft_recovered", False):
+        t_rec = st.session_state.get("live_timer_offset", 0)
+        mins_rec, secs_rec = int(t_rec // 60), int(t_rec % 60)
+        st.success(f"📋 Partido recuperado — {len(st.session_state['live_eventos'])} evento(s) · Cronómetro: {mins_rec:02d}:{secs_rec:02d}")
+
+    if st.session_state.get("live_eventos") or st.session_state.get("live_timer_offset", 0) > 0:
+        if st.button("🗑️ Descartar borrador y empezar de cero", type="secondary"):
+            db.delete_live_draft(equipo["id"])
+            for k in ["live_eventos", "live_timer_start", "live_timer_offset",
+                      "live_timer_running", "live_medio_tiempo_min", "live_draft_checked"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    # Número de partes (modo torneo = 1 parte)
+    num_partes = st.selectbox(
+        "Número de partes",
+        options=[2, 1],
+        index=0 if st.session_state.get("live_num_partes", 2) == 2 else 1,
+        format_func=lambda x: f"{x} {'partes (normal)' if x == 2 else 'parte (torneo/partido corto)'}",
+        key="live_num_partes_sel",
+    )
+    if num_partes != st.session_state.get("live_num_partes"):
+        st.session_state["live_num_partes"] = num_partes
 
     # ── Cronómetro ────────────────────────────────────────────────────────────
     st.subheader("⏱️ Cronómetro")
@@ -1196,12 +1291,14 @@ def page_live():
         if col_start.button("▶️ Iniciar", use_container_width=True):
             st.session_state["live_timer_start"] = time.time()
             st.session_state["live_timer_running"] = True
+            _save_live_draft(equipo["id"])
             st.rerun()
     else:
         if col_pause.button("⏸ Pausar", use_container_width=True):
             st.session_state["live_timer_offset"] += time.time() - st.session_state["live_timer_start"]
             st.session_state["live_timer_start"] = None
             st.session_state["live_timer_running"] = False
+            _save_live_draft(equipo["id"])
             st.rerun()
 
     if col_reset.button("🔄 Reiniciar", use_container_width=True):
@@ -1209,24 +1306,30 @@ def page_live():
             "live_timer_start": None, "live_timer_offset": 0.0,
             "live_timer_running": False, "live_medio_tiempo_min": None,
         })
+        _save_live_draft(equipo["id"])
         st.rerun()
 
-    if st.session_state["live_medio_tiempo_min"] is None:
-        if col_mt.button("⏱ Medio tiempo", use_container_width=True):
-            mt_min = int(tiempo_actual() // 60)
-            st.session_state["live_medio_tiempo_min"] = mt_min
-            if st.session_state["live_timer_running"]:
-                st.session_state["live_timer_offset"] += time.time() - st.session_state["live_timer_start"]
-                st.session_state["live_timer_start"] = None
-                st.session_state["live_timer_running"] = False
-            st.session_state["live_eventos"].append({
-                "event_type": "medio_tiempo", "minuto": mt_min,
-                "player_id": None, "player_id2": None,
-                "player_name": None, "player2_name": None,
-            })
-            st.rerun()
+    num_partes_actual = st.session_state.get("live_num_partes", 2)
+    if num_partes_actual == 2:
+        if st.session_state["live_medio_tiempo_min"] is None:
+            if col_mt.button("⏱ Medio tiempo", use_container_width=True):
+                mt_min = int(tiempo_actual() // 60)
+                st.session_state["live_medio_tiempo_min"] = mt_min
+                if st.session_state["live_timer_running"]:
+                    st.session_state["live_timer_offset"] += time.time() - st.session_state["live_timer_start"]
+                    st.session_state["live_timer_start"] = None
+                    st.session_state["live_timer_running"] = False
+                st.session_state["live_eventos"].append({
+                    "event_type": "medio_tiempo", "minuto": mt_min,
+                    "player_id": None, "player_id2": None,
+                    "player_name": None, "player2_name": None,
+                })
+                _save_live_draft(equipo["id"])
+                st.rerun()
+        else:
+            col_mt.info(f"Descanso · min {st.session_state['live_medio_tiempo_min']}")
     else:
-        col_mt.info(f"Descanso · min {st.session_state['live_medio_tiempo_min']}")
+        col_mt.caption("1 parte — sin descanso")
 
     # ── Panel de eventos ──────────────────────────────────────────────────────
     st.divider()
@@ -1234,6 +1337,20 @@ def page_live():
 
     titulares_actuales = _calcular_titulares_actuales(titulares_inicio, st.session_state["live_eventos"])
     suplentes_disponibles = [j for j in jugadores_convocados if j not in titulares_actuales]
+
+    # I5: mostrar quién está en el campo y quiénes son suplentes
+    if titulares_actuales or suplentes_disponibles:
+        col_campo, col_sup = st.columns(2)
+        with col_campo:
+            st.markdown("**⚽ En el campo:**")
+            for j in titulares_actuales:
+                pos = lineup_reverse.get(j, "")
+                st.markdown(f"🟢 **{j}**" + (f" *({pos})*" if pos else ""))
+        with col_sup:
+            st.markdown("**🪑 Suplentes:**")
+            for j in suplentes_disponibles:
+                st.markdown(f"🔵 {j}")
+        st.divider()
 
     col_gol_f, col_gol_c = st.columns(2)
 
@@ -1253,6 +1370,7 @@ def page_live():
                     "player_name": goleador,
                     "player2_name": ast_name,
                 })
+                _save_live_draft(equipo["id"])
                 st.rerun()
 
     with col_gol_c:
@@ -1265,6 +1383,7 @@ def page_live():
                 "player_id": None, "player_id2": None,
                 "player_name": None, "player2_name": None,
             })
+            _save_live_draft(equipo["id"])
             st.rerun()
 
     col_am, col_ro = st.columns(2)
@@ -1280,6 +1399,7 @@ def page_live():
                     "player_id": player_ids.get(jugador_am), "player_id2": None,
                     "player_name": jugador_am, "player2_name": None,
                 })
+                _save_live_draft(equipo["id"])
                 st.rerun()
 
     with col_ro:
@@ -1293,6 +1413,7 @@ def page_live():
                     "player_id": player_ids.get(jugador_ro), "player_id2": None,
                     "player_name": jugador_ro, "player2_name": None,
                 })
+                _save_live_draft(equipo["id"])
                 st.rerun()
 
     st.markdown("**🔄 Cambio**")
@@ -1309,6 +1430,7 @@ def page_live():
                 "player_name": jugador_sale,
                 "player2_name": jugador_entra,
             })
+            _save_live_draft(equipo["id"])
             st.rerun()
 
     # ── Log de eventos ────────────────────────────────────────────────────────
@@ -1359,6 +1481,16 @@ def page_live():
         fecha_live_fin = st.date_input("📅 Fecha", value=datetime.today())
         notas_live_fin = st.text_area("📝 Notas (opcional)")
         mvps_live = st.multiselect("🌟 MVPs (máx. 3)", options=jugadores_convocados, max_selections=3)
+        # I6: ajuste del minuto de descanso (visible solo en partidos de 2 partes)
+        num_partes_fin = st.session_state.get("live_num_partes", 2)
+        if num_partes_fin == 2:
+            default_mt_val = st.session_state.get("live_medio_tiempo_min") or equipo["minutos_partido"] // 2
+            min_mt_fin = st.number_input(
+                "⏱ Minuto de medio tiempo (ajustar si hubo tiempo extra o se olvidó pulsar)",
+                value=int(default_mt_val), min_value=1, max_value=90, step=1,
+            )
+        else:
+            min_mt_fin = None
         btn_fin = st.form_submit_button("🏁 Guardar partido")
 
     if btn_fin:
@@ -1374,6 +1506,8 @@ def page_live():
                 lineup_reverse=lineup_reverse,
                 tiempo_total_seg=tiempo_actual(),
                 minutos_partido=equipo["minutos_partido"],
+                num_partes=st.session_state.get("live_num_partes", 2),
+                min_mt_override=min_mt_fin,
             )
             mvp_ids_live = [player_ids[n] for n in mvps_live if n in player_ids]
             match = db.create_match(
@@ -1389,9 +1523,11 @@ def page_live():
             )
             if match:
                 db.create_match_events(match["id"], eventos)
+                db.delete_live_draft(equipo["id"])
                 st.success("✅ Partido guardado correctamente.")
                 for k in ["live_eventos", "live_timer_start", "live_timer_offset",
-                          "live_timer_running", "live_medio_tiempo_min"]:
+                          "live_timer_running", "live_medio_tiempo_min",
+                          "live_num_partes", "live_draft_checked"]:
                     st.session_state.pop(k, None)
                 st.rerun()
             else:

@@ -520,6 +520,36 @@ def create_match_events(match_id: str, events: list[dict]) -> bool:
         return False
 
 
+def save_live_draft(team_id: str, draft: dict) -> bool:
+    """UPSERT del borrador del partido en directo."""
+    try:
+        get_client().table("match_drafts").upsert(
+            {"team_id": team_id, **draft},
+            on_conflict="team_id",
+        ).execute()
+        return True
+    except Exception:
+        return False
+
+
+def get_live_draft(team_id: str) -> Optional[dict]:
+    """Lee el borrador activo del equipo. Devuelve None si no existe."""
+    try:
+        res = get_client().table("match_drafts").select("*").eq("team_id", team_id).execute()
+        return res.data[0] if res.data else None
+    except Exception:
+        return None
+
+
+def delete_live_draft(team_id: str) -> bool:
+    """Elimina el borrador al finalizar o descartar el partido."""
+    try:
+        get_client().table("match_drafts").delete().eq("team_id", team_id).execute()
+        return True
+    except Exception:
+        return False
+
+
 def get_mvp_ranking(team_id: str) -> list[dict]:
     """Ranking de MVPs de la temporada: [{Jugador, MVPs}], ordenado desc."""
     try:
